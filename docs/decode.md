@@ -25,6 +25,7 @@ enum spng_decode_flags
 
     SPNG_DECODE_TRNS = 1, /* Apply transparency */
     SPNG_DECODE_GAMMA = 2, /* Apply gamma correction */
+    SPNG_DECODE_PREMULTIPLIED_ALPHA = 16, /* Premultiply color components by alpha */
     SPNG_DECODE_PROGRESSIVE = 256 /* Initialize for progressive reads */
 };
 ```
@@ -206,6 +207,23 @@ the values of `out`, `len` are ignored.
 The `SPNG_DECODE_TRNS` flag is silently ignored if the PNG does not
 contain a tRNS chunk or is not applicable for the color type.
 
+The `SPNG_DECODE_PREMULTIPLIED_ALPHA` flag outputs premultiplied alpha:
+each color component is multiplied by the pixel's alpha component and
+rounded to the nearest integer. The conversion is applied as the last
+decoding step, after tRNS transparency, sBIT scaling and gamma correction,
+so the color components use the same gamma semantics as straight-alpha
+output. It is supported for the `SPNG_FMT_RGBA8`, `SPNG_FMT_RGBA16`,
+`SPNG_FMT_GA8` and `SPNG_FMT_GA16` output formats and silently ignored
+otherwise (including `SPNG_FMT_RGB8`, `SPNG_FMT_G8`, `SPNG_FMT_PNG` and
+`SPNG_FMT_RAW`).
+
+Premultiplied and straight-alpha output of the same format and flags are
+exactly convertible: for an 8-bit channel `out = (color * alpha + 127) / 255`,
+for a 16-bit channel `out = (color * alpha + 32767) / 65535`; the alpha
+component itself is never modified. Fully transparent pixels (alpha 0)
+have all color components set to zero, fully opaque pixels (alpha at the
+channel maximum) keep their color components unchanged.
+
 This function can only be called once per context.
 
 ## Supported format, flag combinations
@@ -228,8 +246,12 @@ This function can only be called once per context.
 
 The `SPNG_DECODE_PROGRESSIVE` flag is supported in all cases.
 
-The alpha channel is always [straight alpha](https://en.wikipedia.org/wiki/Alpha_compositing#Straight_versus_premultiplied),
-premultiplied alpha is not supported.
+The `SPNG_DECODE_PREMULTIPLIED_ALPHA` flag only applies to the
+`SPNG_FMT_RGBA8`, `SPNG_FMT_RGBA16`, `SPNG_FMT_GA8` and `SPNG_FMT_GA16`
+output formats and is silently ignored by the other formats.
+
+The alpha channel defaults to [straight alpha](https://en.wikipedia.org/wiki/Alpha_compositing#Straight_versus_premultiplied),
+pass the `SPNG_DECODE_PREMULTIPLIED_ALPHA` decode flag to get premultiplied alpha.
 
 ## Progressive image decoding
 

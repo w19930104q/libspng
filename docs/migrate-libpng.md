@@ -148,8 +148,9 @@ PNG formats are converted to the destination `spng_format` when decoding or
 converted from the `spng_format` to the destination PNG format when encoding.
 When the destination format has an alpha channel and the source doesn't the alpha samples
 are implicitly set to the fully opaque, maximum value.
-The alpha channel is always [straight alpha](https://en.wikipedia.org/wiki/Alpha_compositing#Straight_versus_premultiplied),
-premultiplied alpha is not supported.
+The alpha channel defaults to [straight alpha](https://en.wikipedia.org/wiki/Alpha_compositing#Straight_versus_premultiplied),
+premultiplied alpha can be requested when decoding with the
+`SPNG_DECODE_PREMULTIPLIED_ALPHA` decode flag.
 
 !!! note
     Some source/destination combinations are not supported, check supported format, flags combinations for [decoding](decode.md#supported-format-flag-combinations) and [encoding](encode.md#supported-format-flag-combinations).

@@ -195,6 +195,7 @@ enum spng_decode_flags
 
     SPNG_DECODE_TRNS = 1, /* Apply transparency */
     SPNG_DECODE_GAMMA = 2, /* Apply gamma correction */
+    SPNG_DECODE_PREMULTIPLIED_ALPHA = 16, /* Premultiply color components by alpha */
     SPNG_DECODE_PROGRESSIVE = 256 /* Initialize for progressive reads */
 };
 

@@ -62,8 +62,9 @@ enum spng_format
 !!! note
     The channels are always in [byte-order](https://en.wikipedia.org/wiki/RGBA_color_model#RGBA8888) representation.
 
-    The alpha channel is always [straight alpha](https://en.wikipedia.org/wiki/Alpha_compositing#Straight_versus_premultiplied),
-    premultiplied alpha is not supported.
+    The alpha channel defaults to [straight alpha](https://en.wikipedia.org/wiki/Alpha_compositing#Straight_versus_premultiplied),
+    premultiplied alpha is available when decoding with the
+    `SPNG_DECODE_PREMULTIPLIED_ALPHA` decode flag.
 
 # spng_filter
 ```c

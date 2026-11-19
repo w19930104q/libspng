@@ -1,3 +1,10 @@
+premultiply_test_exe = executable('premultiply_test',
+    'premultiply_test.c',
+    dependencies : spng_dep
+)
+
+test('premultiply_alpha', premultiply_test_exe)
+
 if get_option('dev_build') == false
     subdir_done()
 endif

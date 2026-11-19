@@ -162,6 +162,7 @@ struct decode_flags
     unsigned same_layout: 1;
     unsigned zerocopy:    1;
     unsigned unpack:      1;
+    unsigned premultiply_alpha: 1;
 };
 
 struct encode_flags
@@ -1778,6 +1779,72 @@ static inline void gamma_correct_row(unsigned char *row, uint32_t pixels, int fm
             px[0] = gamma_lut[px[0]];
             px[1] = gamma_lut[px[1]];
             px[2] = gamma_lut[px[2]];
+        }
+    }
+}
+
+/* Premultiply straight-alpha color components by the alpha component.
+   Applied last, after any tRNS, sBIT scaling and gamma correction, so the
+   inputs always have the same bit depth as the output format.
+   Round-to-nearest: (c * a + max/2) / max, guarantees c == 0 for a == 0
+   and c unchanged for a == max. All intermediates fit in 32 bits. */
+static inline uint8_t spng__premultiply8(uint8_t c, uint8_t a)
+{
+    return (uint8_t)(((uint32_t)c * a + 127u) / 255u);
+}
+
+static inline uint16_t spng__premultiply16(uint16_t c, uint16_t a)
+{
+    return (uint16_t)(((uint32_t)c * a + 32767u) / 65535u);
+}
+
+static inline void premultiply_row(unsigned char *row, uint32_t pixels, int fmt)
+{
+    uint32_t i;
+
+    if(fmt == SPNG_FMT_RGBA8)
+    {
+        unsigned char *px;
+        for(i=0; i < pixels; i++)
+        {
+            px = row + i * 4;
+
+            px[0] = spng__premultiply8(px[0], px[3]);
+            px[1] = spng__premultiply8(px[1], px[3]);
+            px[2] = spng__premultiply8(px[2], px[3]);
+        }
+    }
+    else if(fmt == SPNG_FMT_RGBA16)
+    {
+        for(i=0; i < pixels; i++)
+        {
+            uint16_t px[4];
+            memcpy(px, row + i * 8, 8);
+
+            px[0] = spng__premultiply16(px[0], px[3]);
+            px[1] = spng__premultiply16(px[1], px[3]);
+            px[2] = spng__premultiply16(px[2], px[3]);
+
+            memcpy(row + i * 8, px, 8);
+        }
+    }
+    else if(fmt == SPNG_FMT_GA8)
+    {
+        for(i=0; i < pixels; i++)
+        {
+            row[i*2] = spng__premultiply8(row[i*2], row[i*2 + 1]);
+        }
+    }
+    else if(fmt == SPNG_FMT_GA16)
+    {
+        for(i=0; i < pixels; i++)
+        {
+            uint16_t gray, alpha;
+            memcpy(&gray, row + i * 4, 2);
+            memcpy(&alpha, row + i * 4 + 2, 2);
+
+            gray = spng__premultiply16(gray, alpha);
+            memcpy(row + i * 4, &gray, 2);
         }
     }
 }
@@ -3528,6 +3595,10 @@ int spng_decode_scanline(spng_ctx *ctx, void *out, size_t len)
 
     if(f.apply_gamma) gamma_correct_row(out, width, fmt, gamma_lut);
 
+    /* Premultiplication is the last stage so it operates on the final
+       straight-alpha values with the same gamma semantics as straight output */
+    if(f.premultiply_alpha) premultiply_row(out, width, fmt);
+
     /* The previous scanline is always defiltered */
     void *t = ctx->prev_scanline;
     ctx->prev_scanline = ctx->scanline;
@@ -3724,6 +3795,15 @@ int spng_decode_image(spng_ctx *ctx, void *out, size_t len, int fmt, int flags)
 
     if(flags & SPNG_DECODE_USE_SBIT && ctx->stored.sbit) f.use_sbit = 1;
     else flags &= ~SPNG_DECODE_USE_SBIT;
+
+    /* Only formats with a straight alpha channel can be premultiplied,
+       the flag is silently ignored for everything else */
+    if(flags & SPNG_DECODE_PREMULTIPLIED_ALPHA &&
+       fmt & (SPNG_FMT_RGBA8 | SPNG_FMT_RGBA16 | SPNG_FMT_GA8 | SPNG_FMT_GA16))
+    {
+        f.premultiply_alpha = 1;
+    }
+    flags &= ~SPNG_DECODE_PREMULTIPLIED_ALPHA;
 
     if(fmt & (SPNG_FMT_RGBA8 | SPNG_FMT_RGBA16))
     {
