@@ -114,7 +114,9 @@ Decoding an image requires at least 2 rows to be kept in memory,
 3 if the image is interlaced.
 
 Gamma correction requires an additional 128KB for a lookup table if
-the output format has 16 bits per channel (e.g. `SPNG_FMT_RGBA16`).
+the output format has 16 bits per channel (e.g. `SPNG_FMT_RGBA16`,
+`SPNG_FMT_GA16`), 8-bit per channel formats share a 512 byte lookup
+table stored in the context.
 
 To limit memory usage for image decoding use `spng_set_image_limits()`
 to set an image width/height limit.
@@ -215,16 +217,17 @@ This function can only be called once per context.
 | Any format*  | `SPNG_FMT_RGBA8`  | All    | Convert from any PNG format and bit depth     |
 | Any format   | `SPNG_FMT_RGBA16` | All    | Convert from any PNG format and bit depth     |
 | Any format   | `SPNG_FMT_RGB8`   | All    | Convert from any PNG format and bit depth     |
-| Gray <=8-bit | `SPNG_FMT_G8`     | None** | Only valid for 1, 2, 4, 8-bit grayscale PNG's |
-| Gray 16-bit  | `SPNG_FMT_GA16`   | All**  | Only valid for 16-bit grayscale PNG's         |
-| Gray <=8-bit | `SPNG_FMT_GA8`    | All**  | Only valid for 1, 2, 4, 8-bit grayscale PNG's |
+| Gray <=8-bit | `SPNG_FMT_G8`     | All    | Only valid for 1, 2, 4, 8-bit grayscale PNG's |
+| Gray 16-bit  | `SPNG_FMT_GA16`   | All    | Only valid for 16-bit grayscale PNG's         |
+| Gray <=8-bit | `SPNG_FMT_GA8`    | All    | Only valid for 1, 2, 4, 8-bit grayscale PNG's |
 | Any format   | `SPNG_FMT_PNG`    | None** | The PNG's format in host-endian               |
 | Any format   | `SPNG_FMT_RAW`    | None   | The PNG's format in big-endian                |
 
 
 \* Any combination of color type and bit depth defined in the [standard](https://www.w3.org/TR/2003/REC-PNG-20031110/#table111).
 
-\*\* Gamma correction is not implemented
+\*\* Gamma correction is not implemented for this output format,
+the `SPNG_DECODE_GAMMA` flag is silently ignored
 
 The `SPNG_DECODE_PROGRESSIVE` flag is supported in all cases.
 

@@ -151,6 +151,12 @@ static int compare_images(const struct spng_ihdr *ihdr,
         have_alpha = 1;
         max_diff = 256 / diff_div;
     }
+    else if(fmt == SPNG_FMT_GA16)
+    {
+        bytes_per_pixel = 4;
+        have_alpha = 1;
+        max_diff = 65536 / diff_div;
+    }
     else if(fmt == SPNG_FMT_G8)
     {
         bytes_per_pixel = 1;
@@ -235,10 +241,15 @@ static int compare_images(const struct spng_ihdr *ihdr,
                     memcpy(&s_sample, img_spng + px_ofs, 1);
                     memcpy(&p_sample, img_png + px_ofs, 1);
 
-                    shift_amount = 8 - ihdr->bit_depth - (x * ihdr->bit_depth) % 8;
+                    /* G8/GA8 outputs are expanded to 8-bit samples,
+                       only PNG/RAW keep the samples packed */
+                    if(fmt & (SPNG_FMT_PNG | SPNG_FMT_RAW))
+                    {
+                        shift_amount = 8 - ihdr->bit_depth - (x * ihdr->bit_depth) % 8;
 
-                    s_sample = (s_sample >> shift_amount) & mask;
-                    p_sample = (p_sample >> shift_amount) & mask;
+                        s_sample = (s_sample >> shift_amount) & mask;
+                        p_sample = (p_sample >> shift_amount) & mask;
+                    }
 
                     spng_sample = s_sample;
                     png_sample = p_sample;
@@ -1355,11 +1366,16 @@ int main(int argc, char **argv)
     add_test_case(SPNG_FMT_RGB8, SPNG_DECODE_GAMMA, gamma_bug);
 
     add_test_case(SPNG_FMT_G8, 0, fmt_limit);
+    add_test_case(SPNG_FMT_G8, SPNG_DECODE_GAMMA, fmt_limit);
     add_test_case(SPNG_FMT_GA8, 0, fmt_limit);
     add_test_case(SPNG_FMT_GA8, SPNG_DECODE_TRNS, fmt_limit);
+    add_test_case(SPNG_FMT_GA8, SPNG_DECODE_GAMMA, fmt_limit);
+    add_test_case(SPNG_FMT_GA8, SPNG_DECODE_TRNS | SPNG_DECODE_GAMMA, fmt_limit);
 
     add_test_case(SPNG_FMT_GA16, 0, fmt_limit_2);
     add_test_case(SPNG_FMT_GA16, SPNG_DECODE_TRNS, fmt_limit_2);
+    add_test_case(SPNG_FMT_GA16, SPNG_DECODE_GAMMA, fmt_limit_2);
+    add_test_case(SPNG_FMT_GA16, SPNG_DECODE_TRNS | SPNG_DECODE_GAMMA, fmt_limit_2);
 
     /* This tests the input->output format logic used in libvips,
        it emulates the behavior of their old PNG loader which uses libpng. */

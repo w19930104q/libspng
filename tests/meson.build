@@ -33,6 +33,9 @@ test_exe = executable('testsuite', 'testsuite.c', dependencies : test_deps)
 
 test('info', test_exe, args : 'info')
 
+gamma_test_exe = executable('gamma_test', 'gamma_test.c', dependencies : spng_dep)
+test('gamma_cross_format', gamma_test_exe)
+
 cpp_exe = executable('cpp_exe', 'test.cpp', dependencies : spng_dep)
 test('cpp_test', cpp_exe)
 

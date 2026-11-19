@@ -1780,6 +1780,30 @@ static inline void gamma_correct_row(unsigned char *row, uint32_t pixels, int fm
             px[2] = gamma_lut[px[2]];
         }
     }
+    else if(fmt == SPNG_FMT_G8)
+    {
+        for(i=0; i < pixels; i++)
+        {
+            row[i] = gamma_lut[row[i]];
+        }
+    }
+    else if(fmt == SPNG_FMT_GA8)
+    {/* Alpha is not gamma corrected */
+        for(i=0; i < pixels; i++)
+        {
+            row[i * 2] = gamma_lut[row[i * 2]];
+        }
+    }
+    else if(fmt == SPNG_FMT_GA16)
+    {/* Alpha is not gamma corrected */
+        for(i=0; i < pixels; i++)
+        {
+            uint16_t gray;
+            memcpy(&gray, row + i * 4, 2);
+            gray = gamma_lut[gray];
+            memcpy(row + i * 4, &gray, 2);
+        }
+    }
 }
 
 /* Apply transparency to output row */
@@ -3775,7 +3799,7 @@ int spng_decode_image(spng_ctx *ctx, void *out, size_t len, int fmt, int flags)
 
         unsigned lut_entries;
 
-        if(fmt & (SPNG_FMT_RGBA8 | SPNG_FMT_RGB8))
+        if(fmt & (SPNG_FMT_RGBA8 | SPNG_FMT_RGB8 | SPNG_FMT_G8 | SPNG_FMT_GA8))
         {
             lut_entries = 256;
             max = 255.0f;
@@ -3783,7 +3807,7 @@ int spng_decode_image(spng_ctx *ctx, void *out, size_t len, int fmt, int flags)
             gamma_lut = ctx->gamma_lut8;
             ctx->gamma_lut = ctx->gamma_lut8;
         }
-        else /* SPNG_FMT_RGBA16 */
+        else /* SPNG_FMT_RGBA16, SPNG_FMT_GA16 */
         {
             lut_entries = 65536;
             max = 65535.0f;
