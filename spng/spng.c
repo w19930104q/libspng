@@ -628,6 +628,109 @@ static int calculate_subimages(struct spng_ctx *ctx)
     return 0;
 }
 
+/* ===== Row/scanline state machine, shared between the decoder and encoder ===== */
+
+/* Pixel size in bytes for the given output format.
+   SPNG_FMT_PNG/SPNG_FMT_RAW use the same sample layout as the PNG file */
+static unsigned spng__fmt_pixel_size(const spng_ctx *ctx, int fmt)
+{
+    if(fmt & (SPNG_FMT_PNG | SPNG_FMT_RAW)) return ctx->bytes_per_pixel;
+
+    switch(fmt)
+    {
+        case SPNG_FMT_RGBA16: return 8;
+        case SPNG_FMT_RGB8: return 3;
+        case SPNG_FMT_G8: return 1;
+        case SPNG_FMT_GA8: return 2;
+        default: return 4; /* SPNG_FMT_RGBA8 */
+    }
+}
+
+/* Scanline buffer size, large enough for the widest pass */
+static int spng__scanline_buf_size(const spng_ctx *ctx, size_t *buf_size)
+{
+    size_t size = ctx->subimage[ctx->widest_pass].scanline_width;
+
+    size += 32;
+
+    if(size < 32) return SPNG_EOVERFLOW;
+
+    *buf_size = size;
+
+    return 0;
+}
+
+/* Horizontal offset of pixel k within the full image row for the given Adam7 pass */
+static size_t spng__adam7_x_offset(int pass, uint32_t k)
+{
+    return adam7_x_start[pass] + (size_t)k * adam7_x_delta[pass];
+}
+
+/* Bit shift for the sample at ioffset in a packed (sub-byte) row */
+static unsigned spng__packed_sample_shift(unsigned bit_depth, size_t ioffset)
+{
+    return 8 - bit_depth - (unsigned)(ioffset * bit_depth % 8);
+}
+
+/* Initialize the row state machine, skipping empty passes */
+static void spng__init_row_state(spng_ctx *ctx, int interlaced)
+{
+    struct spng_row_info *ri = &ctx->row_info;
+    const struct spng_subimage *sub = ctx->subimage;
+
+    while(!sub[ri->pass].width || !sub[ri->pass].height) ri->pass++;
+
+    if(interlaced) ri->row_num = adam7_y_start[ri->pass];
+}
+
+/* Advance to the next scanline/row, returns SPNG_EOI after the last one */
+static int spng__update_row_info(spng_ctx *ctx)
+{
+    int interlacing = ctx->ihdr.interlace_method;
+    struct spng_row_info *ri = &ctx->row_info;
+    const struct spng_subimage *sub = ctx->subimage;
+
+    if(ri->scanline_idx == (sub[ri->pass].height - 1)) /* Last scanline */
+    {
+        if(ri->pass == ctx->last_pass)
+        {
+            ctx->state = SPNG_STATE_EOI;
+
+            return SPNG_EOI;
+        }
+
+        ri->scanline_idx = 0;
+        ri->pass++;
+
+        /* Skip empty passes */
+        while( (!sub[ri->pass].width || !sub[ri->pass].height) && (ri->pass < ctx->last_pass)) ri->pass++;
+    }
+    else
+    {
+        ri->row_num++;
+        ri->scanline_idx++;
+    }
+
+    if(interlacing) ri->row_num = adam7_y_start[ri->pass] + ri->scanline_idx * adam7_y_delta[ri->pass];
+
+    return 0;
+}
+
+/* Byte offset of the current row in the output image */
+static size_t spng__row_offset(const spng_ctx *ctx)
+{
+    return ctx->row_info.row_num * ctx->image_width;
+}
+
+/* Swap scanline buffers; the previous scanline is always defiltered (decoding)
+   or unfiltered (encoding) */
+static void spng__swap_scanline_bufs(spng_ctx *ctx)
+{
+    void *t = ctx->prev_scanline;
+    ctx->prev_scanline = ctx->scanline;
+    ctx->scanline = t;
+}
+
 static int check_decode_fmt(const struct spng_ihdr *ihdr, const int fmt)
 {
     switch(fmt)
@@ -3254,38 +3357,6 @@ static int read_scanline(spng_ctx *ctx)
     return 0;
 }
 
-static int update_row_info(spng_ctx *ctx)
-{
-    int interlacing = ctx->ihdr.interlace_method;
-    struct spng_row_info *ri = &ctx->row_info;
-    const struct spng_subimage *sub = ctx->subimage;
-
-    if(ri->scanline_idx == (sub[ri->pass].height - 1)) /* Last scanline */
-    {
-        if(ri->pass == ctx->last_pass)
-        {
-            ctx->state = SPNG_STATE_EOI;
-
-            return SPNG_EOI;
-        }
-
-        ri->scanline_idx = 0;
-        ri->pass++;
-
-        /* Skip empty passes */
-        while( (!sub[ri->pass].width || !sub[ri->pass].height) && (ri->pass < ctx->last_pass)) ri->pass++;
-    }
-    else
-    {
-        ri->row_num++;
-        ri->scanline_idx++;
-    }
-
-    if(interlacing) ri->row_num = adam7_y_start[ri->pass] + ri->scanline_idx * adam7_y_delta[ri->pass];
-
-    return 0;
-}
-
 int spng_decode_scanline(spng_ctx *ctx, void *out, size_t len)
 {
     if(ctx == NULL || out == NULL) return 1;
@@ -3529,11 +3600,9 @@ int spng_decode_scanline(spng_ctx *ctx, void *out, size_t len)
     if(f.apply_gamma) gamma_correct_row(out, width, fmt, gamma_lut);
 
     /* The previous scanline is always defiltered */
-    void *t = ctx->prev_scanline;
-    ctx->prev_scanline = ctx->scanline;
-    ctx->scanline = t;
+    spng__swap_scanline_bufs(ctx);
 
-    ret = update_row_info(ctx);
+    ret = spng__update_row_info(ctx);
 
     if(ret == SPNG_EOI)
     {
@@ -3565,40 +3634,35 @@ int spng_decode_row(spng_ctx *ctx, void *out, size_t len)
     if(ret && ret != SPNG_EOI) return ret;
 
     uint32_t k;
-    unsigned pixel_size = 4; /* RGBA8 */
-    if(ctx->fmt == SPNG_FMT_RGBA16) pixel_size = 8;
-    else if(ctx->fmt == SPNG_FMT_RGB8) pixel_size = 3;
-    else if(ctx->fmt == SPNG_FMT_G8) pixel_size = 1;
-    else if(ctx->fmt == SPNG_FMT_GA8) pixel_size = 2;
-    else if(ctx->fmt & (SPNG_FMT_PNG | SPNG_FMT_RAW))
+    unsigned pixel_size;
+
+    if(ctx->fmt & (SPNG_FMT_PNG | SPNG_FMT_RAW) && ihdr->bit_depth < 8)
     {
-        if(ihdr->bit_depth < 8)
+        struct spng__iter iter = spng__iter_init(ihdr->bit_depth, ctx->row);
+        const uint8_t samples_per_byte = 8 / ihdr->bit_depth;
+        uint8_t sample;
+
+        for(k=0; k < ctx->subimage[pass].width; k++)
         {
-            struct spng__iter iter = spng__iter_init(ihdr->bit_depth, ctx->row);
-            const uint8_t samples_per_byte = 8 / ihdr->bit_depth;
-            uint8_t sample;
+            sample = get_sample(&iter);
 
-            for(k=0; k < ctx->subimage[pass].width; k++)
-            {
-                sample = get_sample(&iter);
+            size_t ioffset = spng__adam7_x_offset(pass, k);
 
-                size_t ioffset = adam7_x_start[pass] + k * adam7_x_delta[pass];
+            sample = sample << spng__packed_sample_shift(ihdr->bit_depth, ioffset);
 
-                sample = sample << (iter.initial_shift - ioffset * ihdr->bit_depth % 8);
+            ioffset /= samples_per_byte;
 
-                ioffset /= samples_per_byte;
-
-                outptr[ioffset] |= sample;
-            }
-
-            return 0;
+            outptr[ioffset] |= sample;
         }
-        else pixel_size = ctx->bytes_per_pixel;
+
+        return 0;
     }
+
+    pixel_size = spng__fmt_pixel_size(ctx, ctx->fmt);
 
     for(k=0; k < ctx->subimage[pass].width; k++)
     {
-        size_t ioffset = (adam7_x_start[pass] + (size_t) k * adam7_x_delta[pass]) * pixel_size;
+        size_t ioffset = spng__adam7_x_offset(pass, k) * pixel_size;
 
         memcpy(outptr + ioffset, ctx->row + k * pixel_size, pixel_size);
     }
@@ -3671,11 +3735,10 @@ int spng_decode_image(spng_ctx *ctx, void *out, size_t len, int fmt, int flags)
     ctx->zstream.avail_in = bytes_read;
     ctx->zstream.next_in = ctx->data;
 
-    size_t scanline_buf_size = ctx->subimage[ctx->widest_pass].scanline_width;
+    size_t scanline_buf_size;
 
-    scanline_buf_size += 32;
-
-    if(scanline_buf_size < 32) return SPNG_EOVERFLOW;
+    ret = spng__scanline_buf_size(ctx, &scanline_buf_size);
+    if(ret) return ret;
 
     ctx->scanline_buf = spng__malloc(ctx, scanline_buf_size);
     ctx->prev_scanline_buf = spng__malloc(ctx, scanline_buf_size);
@@ -3960,16 +4023,9 @@ int spng_decode_image(spng_ctx *ctx, void *out, size_t len, int fmt, int flags)
     struct spng_row_info *ri = &ctx->row_info;
     struct spng_subimage *sub = ctx->subimage;
 
-    while(!sub[ri->pass].width || !sub[ri->pass].height) ri->pass++;
+    spng__init_row_state(ctx, f.interlaced);
 
-    if(f.interlaced) ri->row_num = adam7_y_start[ri->pass];
-
-    unsigned pixel_size = 4; /* SPNG_FMT_RGBA8 */
-
-    if(fmt == SPNG_FMT_RGBA16) pixel_size = 8;
-    else if(fmt == SPNG_FMT_RGB8) pixel_size = 3;
-    else if(fmt == SPNG_FMT_G8) pixel_size = 1;
-    else if(fmt == SPNG_FMT_GA8) pixel_size = 2;
+    unsigned pixel_size = spng__fmt_pixel_size(ctx, fmt);
 
     int i;
     for(i=ri->pass; i <= ctx->last_pass; i++)
@@ -3998,7 +4054,7 @@ int spng_decode_image(spng_ctx *ctx, void *out, size_t len, int fmt, int flags)
 
     do
     {
-        size_t ioffset = ri->row_num * ctx->image_width;
+        size_t ioffset = spng__row_offset(ctx);
 
         ret = spng_decode_row(ctx, (unsigned char*)out + ioffset, ctx->image_width);
     }while(!ret);
@@ -4604,11 +4660,9 @@ static int encode_scanline(spng_ctx *ctx, const void *scanline, size_t len)
     if(ret) return encode_err(ctx, ret);
 
     /* The previous scanline is always unfiltered */
-    void *t = ctx->prev_scanline;
-    ctx->prev_scanline = ctx->scanline;
-    ctx->scanline = t;
+    spng__swap_scanline_bufs(ctx);
 
-    ret = update_row_info(ctx);
+    ret = spng__update_row_info(ctx);
 
     if(ret == SPNG_EOI)
     {
@@ -4652,11 +4706,11 @@ static int encode_row(spng_ctx *ctx, const void *row, size_t len)
 
         for(k=0; k < ctx->subimage[pass].width; k++)
         {
-            size_t ioffset = adam7_x_start[pass] + k * adam7_x_delta[pass];
+            size_t ioffset = spng__adam7_x_offset(pass, k);
 
             sample = row_uc[ioffset / samples_per_byte];
 
-            sample = sample >> (initial_shift - ioffset * bit_depth % 8);
+            sample = sample >> spng__packed_sample_shift(bit_depth, ioffset);
             sample = sample & mask;
             sample = sample << shift_amount;
 
@@ -4676,7 +4730,7 @@ static int encode_row(spng_ctx *ctx, const void *row, size_t len)
 
     for(k=0; k < ctx->subimage[pass].width; k++)
     {
-        size_t ioffset = (adam7_x_start[pass] + (size_t) k * adam7_x_delta[pass]) * pixel_size;
+        size_t ioffset = spng__adam7_x_offset(pass, k) * pixel_size;
 
         memcpy(ctx->scanline + k * pixel_size, (unsigned char*)row + ioffset, pixel_size);
     }
@@ -4803,11 +4857,10 @@ int spng_encode_image(spng_ctx *ctx, const void *img, size_t len, int fmt, int f
     ret = spng__deflate_init(ctx, &ctx->image_options);
     if(ret) return encode_err(ctx, ret);
 
-    size_t scanline_buf_size = ctx->subimage[ctx->widest_pass].scanline_width;
+    size_t scanline_buf_size;
 
-    scanline_buf_size += 32;
-
-    if(scanline_buf_size < 32) return SPNG_EOVERFLOW;
+    ret = spng__scanline_buf_size(ctx, &scanline_buf_size);
+    if(ret) return ret;
 
     ctx->scanline_buf = spng__malloc(ctx, scanline_buf_size);
     ctx->prev_scanline_buf = spng__malloc(ctx, scanline_buf_size);
@@ -4826,9 +4879,6 @@ int spng_encode_image(spng_ctx *ctx, const void *img, size_t len, int fmt, int f
         ctx->filtered_scanline = ctx->filtered_scanline_buf + 16;
     }
 
-    struct spng_subimage *sub = ctx->subimage;
-    struct spng_row_info *ri = &ctx->row_info;
-
     ctx->fmt = fmt;
 
     z_stream *zstream = &ctx->zstream;
@@ -4845,17 +4895,9 @@ int spng_encode_image(spng_ctx *ctx, const void *img, size_t len, int fmt, int f
 
     if(flags & SPNG_ENCODE_FINALIZE) encode_flags->finalize = 1;
 
-    while(!sub[ri->pass].width || !sub[ri->pass].height) ri->pass++;
+    spng__init_row_state(ctx, encode_flags->interlace);
 
-    if(encode_flags->interlace) ri->row_num = adam7_y_start[ri->pass];
-
-    ctx->pixel_size = 4; /* SPNG_FMT_RGBA8 */
-
-    if(fmt == SPNG_FMT_RGBA16) ctx->pixel_size = 8;
-    else if(fmt == SPNG_FMT_RGB8) ctx->pixel_size = 3;
-    else if(fmt == SPNG_FMT_G8) ctx->pixel_size = 1;
-    else if(fmt == SPNG_FMT_GA8) ctx->pixel_size = 2;
-    else if(fmt & (SPNG_FMT_PNG | SPNG_FMT_RAW)) ctx->pixel_size = ctx->bytes_per_pixel;
+    ctx->pixel_size = spng__fmt_pixel_size(ctx, fmt);
 
     ctx->state = SPNG_STATE_ENCODE_INIT;
 
@@ -4868,7 +4910,7 @@ int spng_encode_image(spng_ctx *ctx, const void *img, size_t len, int fmt, int f
 
     do
     {
-        size_t ioffset = ri->row_num * ctx->image_width;
+        size_t ioffset = spng__row_offset(ctx);
 
         ret = encode_row(ctx, (unsigned char*)img + ioffset, ctx->image_width);
 
