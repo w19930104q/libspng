@@ -120,6 +120,23 @@ enum spng_errno
     SPNG_ENODST,
     SPNG_EOPSTATE,
     SPNG_ENOTFINAL,
+    SPNG_EACTL,         /* Invalid acTL chunk */
+    SPNG_EFCTL,         /* Invalid fcTL chunk */
+    SPNG_EDUP_ACTL,     /* Duplicate acTL chunk */
+    SPNG_EAPNG,         /* APNG sequence or framing error */
+};
+
+enum spng_dispose_op
+{
+    SPNG_DISPOSE_OP_NONE = 0,       /* Keep the frame's region */
+    SPNG_DISPOSE_OP_BACKGROUND = 1, /* Clear the frame's region to fully transparent black */
+    SPNG_DISPOSE_OP_PREVIOUS = 2    /* Restore the region to what it was before the frame */
+};
+
+enum spng_blend_op
+{
+    SPNG_BLEND_OP_SOURCE = 0, /* Replace canvas pixels with frame pixels */
+    SPNG_BLEND_OP_OVER = 1    /* Composite frame pixels over canvas pixels (source over) */
 };
 
 enum spng_text_type
@@ -195,7 +212,8 @@ enum spng_decode_flags
 
     SPNG_DECODE_TRNS = 1, /* Apply transparency */
     SPNG_DECODE_GAMMA = 2, /* Apply gamma correction */
-    SPNG_DECODE_PROGRESSIVE = 256 /* Initialize for progressive reads */
+    SPNG_DECODE_PROGRESSIVE = 256, /* Initialize for progressive reads */
+    SPNG_DECODE_APNG_COMPOSE = 512 /* Composite each frame onto the full canvas */
 };
 
 enum spng_crc_action
@@ -369,6 +387,26 @@ struct spng_exif
     char *data;
 };
 
+/* APNG (Animated PNG) */
+
+struct spng_actl
+{
+    uint32_t num_frames;
+    uint32_t num_plays; /* 0 means infinite */
+};
+
+struct spng_fctl
+{
+    uint32_t width;
+    uint32_t height;
+    uint32_t x_offset;
+    uint32_t y_offset;
+    uint16_t delay_num;
+    uint16_t delay_den; /* 0 is treated as 100 */
+    uint8_t dispose_op; /* enum spng_dispose_op */
+    uint8_t blend_op;   /* enum spng_blend_op */
+};
+
 struct spng_chunk
 {
     size_t offset;
@@ -464,6 +502,24 @@ SPNG_API int spng_decoded_image_size(spng_ctx *ctx, int fmt, size_t *len);
 
 /* Decode */
 SPNG_API int spng_decode_image(spng_ctx *ctx, void *out, size_t len, int fmt, int flags);
+
+/* APNG decoding */
+SPNG_API int spng_get_actl(spng_ctx *ctx, struct spng_actl *actl);
+SPNG_API int spng_get_frame_fctl(spng_ctx *ctx, struct spng_fctl *fctl);
+
+/* Decode one APNG frame.
+   The default image is always decoded first with spng_decode_image().
+   When the first fcTL precedes the IDAT chunks the default image is itself
+   animation frame 0, and this function returns frames 1..N-1. When the
+   default image is hidden (no fcTL before IDAT) it is not an animation
+   frame and this function returns frames 0..N-1 from the fdAT chunks.
+   In either case call this repeatedly until it returns SPNG_EOI.
+   By default only the frame's own region is written to *out (zeroed
+   elsewhere); with SPNG_DECODE_APNG_COMPOSE the frame is composited onto
+   the full canvas, applying fcTL dispose/blend operations exactly as
+   specified by APNG. *fctl receives the current frame's control chunk. */
+SPNG_API int spng_decode_frame(spng_ctx *ctx, void *out, size_t len,
+                               int fmt, int flags, struct spng_fctl *fctl);
 
 /* Progressive decode */
 SPNG_API int spng_decode_scanline(spng_ctx *ctx, void *out, size_t len);

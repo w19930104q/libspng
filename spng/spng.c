@@ -95,6 +95,7 @@ enum spng_state
     SPNG_STATE_EOI, /* Reached the last scanline/row */
     SPNG_STATE_LAST_IDAT, /* Reached last IDAT, set at end of decode_image() */
     SPNG_STATE_AFTER_IDAT, /*  */
+    SPNG_STATE_FRAME_IDLE, /* Between APNG frames */
     SPNG_STATE_IEND, /* Reached IEND */
 };
 
@@ -194,6 +195,8 @@ struct spng_chunk_bitfield
     unsigned offs: 1;
     unsigned exif: 1;
     unsigned unknown: 1;
+    unsigned actl: 1;
+    unsigned fctl: 1;
 };
 
 /* Packed sample iterator */
@@ -361,6 +364,18 @@ struct spng_ctx
     struct spng_row_info row_info;
 
     struct encode_flags encode_flags;
+
+    /* APNG decoder state */
+    struct spng_actl actl;
+    struct spng_fctl fctl; /* control chunk of the current/next frame */
+    struct spng_fctl apng_prev_fctl; /* control chunk of the previously rendered frame */
+    uint32_t apng_seq; /* expected next APNG sequence number */
+    uint32_t apng_frame_idx; /* frames decoded so far (0 = default image) */
+    unsigned fdat_stream: 1; /* current frame data comes from fdAT chunks */
+    unsigned apng_compose: 1; /* canvas compositing requested */
+    unsigned char *apng_canvas; /* full-canvas compositing buffer */
+    unsigned char *apng_prev; /* saved region for DISPOSE_OP_PREVIOUS */
+    size_t apng_image_size; /* canvas size in the decoded format */
 };
 
 static const uint32_t spng_u32max = INT32_MAX;
@@ -394,6 +409,10 @@ static const uint8_t type_time[4] = { 116, 73, 77, 69 };
 
 static const uint8_t type_offs[4] = { 111, 70, 70, 115 };
 static const uint8_t type_exif[4] = { 101, 88, 73, 102 };
+
+static const uint8_t type_actl[4] = { 97,  99,  84, 76 };  /* acTL */
+static const uint8_t type_fctl[4] = { 102, 99,  84, 76 };  /* fcTL */
+static const uint8_t type_fdat[4] = { 102, 100, 65, 84 };  /* fdAT */
 
 static inline void *spng__malloc(spng_ctx *ctx,  size_t size)
 {
@@ -1386,6 +1405,47 @@ static int read_idat_bytes(spng_ctx *ctx, uint32_t *bytes_read)
     return ret;
 }
 
+/* Read at least one byte from the fdAT stream, consuming the 4-byte
+   sequence number that prefixes each fdAT chunk. */
+static int read_fdat_bytes(spng_ctx *ctx, uint32_t *bytes_read)
+{
+    if(ctx == NULL || bytes_read == NULL) return SPNG_EINTERNAL;
+    if(memcmp(ctx->current_chunk.type, type_fdat, 4)) return SPNG_EIDAT_TOO_SHORT;
+
+    int ret;
+    uint32_t len;
+
+    while(!ctx->cur_chunk_bytes_left)
+    {
+        ret = read_header(ctx);
+        if(ret) return ret;
+
+        if(memcmp(ctx->current_chunk.type, type_fdat, 4)) return SPNG_EAPNG;
+
+        /* Every fdAT chunk starts with a 4-byte sequence number */
+        if(ctx->cur_chunk_bytes_left < 4) return SPNG_EAPNG;
+
+        ret = read_chunk_bytes(ctx, 4);
+        if(ret) return ret;
+
+        if(read_u32(ctx->data) != ctx->apng_seq) return SPNG_EAPNG;
+        ctx->apng_seq++;
+    }
+
+    if(ctx->streaming)
+    {
+        len = SPNG_READ_SIZE;
+        if(len > ctx->cur_chunk_bytes_left) len = ctx->cur_chunk_bytes_left;
+    }
+    else len = ctx->cur_chunk_bytes_left;
+
+    ret = read_chunk_bytes(ctx, len);
+
+    *bytes_read = len;
+
+    return ret;
+}
+
 static int read_scanline_bytes(spng_ctx *ctx, unsigned char *dest, size_t len)
 {
     if(ctx == NULL || dest == NULL) return SPNG_EINTERNAL;
@@ -1408,9 +1468,10 @@ static int read_scanline_bytes(spng_ctx *ctx, unsigned char *dest, size_t len)
         {
             if(zstream->avail_out != 0) return SPNG_EIDAT_TOO_SHORT;
         }
-        else if(ret == Z_BUF_ERROR) /* Read more IDAT bytes */
+        else if(ret == Z_BUF_ERROR) /* Read more IDAT/fdAT bytes */
         {
-            ret = read_idat_bytes(ctx, &bytes_read);
+            if(ctx->fdat_stream) ret = read_fdat_bytes(ctx, &bytes_read);
+            else ret = read_idat_bytes(ctx, &bytes_read);
             if(ret) return ret;
 
             zstream->avail_in = bytes_read;
@@ -2202,6 +2263,39 @@ static int check_exif(const struct spng_exif *exif)
     return 0;
 }
 
+static int check_fctl(const struct spng_fctl *fctl, const struct spng_ihdr *ihdr, int first_frame)
+{
+    if(!fctl->width || !fctl->height) return SPNG_EFCTL;
+
+    /* Values are already limited to INT32_MAX when read, these cannot overflow */
+    if((uint64_t)fctl->x_offset + fctl->width > ihdr->width) return SPNG_EFCTL;
+    if((uint64_t)fctl->y_offset + fctl->height > ihdr->height) return SPNG_EFCTL;
+
+    if(fctl->dispose_op > SPNG_DISPOSE_OP_PREVIOUS) return SPNG_EFCTL;
+    if(fctl->blend_op > SPNG_BLEND_OP_OVER) return SPNG_EFCTL;
+
+    if(first_frame)
+    {/* The first frame is the default image and must cover the whole canvas */
+        if(fctl->width != ihdr->width || fctl->height != ihdr->height) return SPNG_EFCTL;
+        if(fctl->x_offset || fctl->y_offset) return SPNG_EFCTL;
+    }
+
+    return 0;
+}
+
+/* Parse fcTL fields, the 4-byte sequence number occupies data[0..3] */
+static void parse_fctl(struct spng_fctl *fctl, const unsigned char *data)
+{
+    fctl->width = read_u32(data + 4);
+    fctl->height = read_u32(data + 8);
+    fctl->x_offset = read_u32(data + 12);
+    fctl->y_offset = read_u32(data + 16);
+    fctl->delay_num = read_u16(data + 20);
+    fctl->delay_den = read_u16(data + 22);
+    fctl->dispose_op = data[24];
+    fctl->blend_op = data[25];
+}
+
 /* Validate PNG keyword */
 static int check_png_keyword(const char *str)
 {
@@ -2259,6 +2353,8 @@ static int is_small_chunk(uint8_t type[4])
     else if(!memcmp(type, type_phys, 4)) return 1;
     else if(!memcmp(type, type_time, 4)) return 1;
     else if(!memcmp(type, type_offs, 4)) return 1;
+    else if(!memcmp(type, type_actl, 4)) return 1;
+    else if(!memcmp(type, type_fctl, 4)) return 1;
     else return 0;
 }
 
@@ -2440,7 +2536,8 @@ static int read_non_idat_chunks(spng_ctx *ctx)
             }
             else if(!memcmp(chunk.type, type_iend, 4))
             {
-                if(ctx->state == SPNG_STATE_AFTER_IDAT)
+                if(ctx->state == SPNG_STATE_AFTER_IDAT ||
+                   ctx->state == SPNG_STATE_FRAME_IDLE)
                 {
                     if(chunk.length) return SPNG_ECHUNK_SIZE;
 
@@ -3040,6 +3137,54 @@ static int read_non_idat_chunks(spng_ctx *ctx)
 
                 ctx->stored.splt = 1;
             }
+            else if(!memcmp(chunk.type, type_actl, 4))
+            {
+                if(ctx->state == SPNG_STATE_AFTER_IDAT) return SPNG_ECHUNK_POS;
+                if(ctx->file.actl) return SPNG_EDUP_ACTL;
+
+                if(chunk.length != 8) return SPNG_ECHUNK_SIZE;
+
+                ctx->actl.num_frames = read_u32(data);
+                ctx->actl.num_plays = read_u32(data + 4);
+
+                if(!ctx->actl.num_frames) return SPNG_EACTL;
+                if(ctx->actl.num_frames > spng_u32max) return SPNG_EACTL;
+                if(ctx->actl.num_plays > spng_u32max) return SPNG_EACTL;
+
+                ctx->file.actl = 1;
+                ctx->stored.actl = 1;
+            }
+            else if(!memcmp(chunk.type, type_fctl, 4))
+            {
+                /* Only the first frame's fcTL (before IDAT) is parsed here;
+                   subsequent fcTL chunks are consumed by spng_decode_frame() */
+                if(ctx->state >= SPNG_STATE_AFTER_IDAT) goto discard;
+
+                if(!ctx->file.actl) return SPNG_ECHUNK_POS; /* fcTL without acTL */
+                if(ctx->file.fctl) return SPNG_ECHUNK_POS; /* only one fcTL may precede IDAT */
+
+                if(chunk.length != 26) return SPNG_ECHUNK_SIZE;
+
+                if(read_u32(data) != ctx->apng_seq) return SPNG_EAPNG;
+
+                struct spng_fctl fctl;
+                parse_fctl(&fctl, data);
+
+                ret = check_fctl(&fctl, &ctx->ihdr, 1);
+                if(ret) return ret;
+
+                ctx->apng_seq++;
+                ctx->fctl = fctl;
+                ctx->file.fctl = 1;
+                ctx->stored.fctl = 1;
+            }
+            else if(!memcmp(chunk.type, type_fdat, 4))
+            {
+                /* fdAT before IDAT is invalid; post-IDAT fdAT chunks are
+                   consumed by spng_decode_frame() */
+                if(ctx->state < SPNG_STATE_AFTER_IDAT) return SPNG_ECHUNK_POS;
+                goto discard;
+            }
             else /* Unknown chunk */
             {
                 ctx->file.unknown = 1;
@@ -3127,9 +3272,15 @@ static int read_chunks(spng_ctx *ctx, int only_ihdr)
 
     if(ctx->state == SPNG_STATE_EOI)
     {
+        /* For APNG the post-IDAT fcTL/fdAT chunks are consumed one frame at
+           a time by spng_decode_frame(), do not read past the default image */
+        if(ctx->file.actl) return 0;
+
         ctx->state = SPNG_STATE_AFTER_IDAT;
         ctx->prev_was_idat = 1;
     }
+
+    if(ctx->state == SPNG_STATE_FRAME_IDLE) return 0;
 
     while(ctx->state < SPNG_STATE_FIRST_IDAT || ctx->state == SPNG_STATE_AFTER_IDAT)
     {
@@ -3158,6 +3309,10 @@ static int read_chunks(spng_ctx *ctx, int only_ihdr)
                 case SPNG_EDUP_TIME:
                 case SPNG_EDUP_OFFS:
                 case SPNG_EDUP_EXIF:
+                case SPNG_EDUP_ACTL:
+                case SPNG_EACTL:
+                case SPNG_EFCTL:
+                case SPNG_EAPNG:
                 case SPNG_ECHRM:
                 case SPNG_ETRNS_COLOR_TYPE:
                 case SPNG_ETRNS_NO_PLTE:
@@ -3616,6 +3771,9 @@ int spng_decode_chunks(spng_ctx *ctx)
     return read_chunks(ctx, 0);
 }
 
+static size_t apng_pixel_size(int fmt);
+static int apng_save_prev_region(spng_ctx *ctx, const struct spng_fctl *fctl);
+
 int spng_decode_image(spng_ctx *ctx, void *out, size_t len, int fmt, int flags)
 {
     if(ctx == NULL) return 1;
@@ -4004,6 +4162,602 @@ int spng_decode_image(spng_ctx *ctx, void *out, size_t len, int fmt, int flags)
     }while(!ret);
 
     if(ret != SPNG_EOI) return decode_err(ctx, ret);
+
+    if(ctx->file.actl)
+    {
+        /* APNG animation frames are never interlaced */
+        if(ihdr->interlace_method) return SPNG_EAPNG;
+
+        ctx->apng_image_size = ctx->image_size;
+        ctx->apng_compose = (flags & SPNG_DECODE_APNG_COMPOSE) ? 1 : 0;
+        ctx->fdat_stream = 0;
+        ctx->apng_canvas = NULL;
+        ctx->apng_prev = NULL;
+
+        if(ctx->file.fctl)
+        {
+            /* The default image is animation frame 0 (fcTL precedes IDAT) */
+            ctx->apng_frame_idx = 1;
+            ctx->apng_prev_fctl = ctx->fctl;
+
+            if(ctx->apng_compose)
+            {
+                if(fmt & (SPNG_FMT_PNG | SPNG_FMT_RAW)) return SPNG_EFMT;
+                if(!apng_pixel_size(fmt)) return SPNG_EFMT;
+
+                /* calloc: a DISPOSE_OP_PREVIOUS frame 0 must be able to save
+                   the fully transparent canvas that precedes the animation */
+                ctx->apng_canvas = spng__calloc(ctx, 1, ctx->image_size);
+                if(ctx->apng_canvas == NULL) return decode_err(ctx, SPNG_EMEM);
+
+                /* Frame 0 may request DISPOSE_OP_PREVIOUS: save the region
+                   *before* rendering, i.e. the empty (pre-frame-0) canvas */
+                if(ctx->fctl.dispose_op == SPNG_DISPOSE_OP_PREVIOUS)
+                {
+                    ret = apng_save_prev_region(ctx, &ctx->fctl);
+                    if(ret) return decode_err(ctx, ret);
+                }
+
+                /* Frame 0 always covers the whole canvas, copy it verbatim */
+                memcpy(ctx->apng_canvas, out, ctx->image_size);
+            }
+        }
+        else
+        {
+            /* Hidden default image: the IDAT stream is not an animation
+               frame, all num_frames frames come from fdAT and are produced
+               by spng_decode_frame(), starting at sequence number 0 */
+            ctx->apng_frame_idx = 0;
+            memset(&ctx->apng_prev_fctl, 0, sizeof(struct spng_fctl));
+            ctx->apng_seq = 0;
+
+            if(ctx->apng_compose)
+            {
+                if(fmt & (SPNG_FMT_PNG | SPNG_FMT_RAW)) return SPNG_EFMT;
+                if(!apng_pixel_size(fmt)) return SPNG_EFMT;
+
+                /* Animation starts on an empty (fully transparent) canvas */
+                ctx->apng_canvas = spng__calloc(ctx, 1, ctx->image_size);
+                if(ctx->apng_canvas == NULL) return decode_err(ctx, SPNG_EMEM);
+            }
+        }
+    }
+
+    return 0;
+}
+
+/* APNG frame decoding **************************************************/
+
+static size_t apng_pixel_size(int fmt)
+{
+    switch(fmt)
+    {
+        case SPNG_FMT_RGBA8: return 4;
+        case SPNG_FMT_RGBA16: return 8;
+        case SPNG_FMT_RGB8: return 3;
+        case SPNG_FMT_G8: return 1;
+        case SPNG_FMT_GA8: return 2;
+        case SPNG_FMT_GA16: return 4;
+        default: return 0;
+    }
+}
+
+/* Frames are never interlaced, only pass 0 is used */
+static int calculate_frame_subimages(spng_ctx *ctx, uint32_t frame_width, uint32_t frame_height)
+{
+    struct spng_subimage *sub = ctx->subimage;
+    int i;
+
+    for(i = 0; i < 7; i++) memset(&sub[i], 0, sizeof(struct spng_subimage));
+
+    ctx->widest_pass = 0;
+    ctx->last_pass = 0;
+
+    sub[0].width = frame_width;
+    sub[0].height = frame_height;
+
+    return calculate_scanline_width(&ctx->ihdr, frame_width, &sub[0].scanline_width);
+}
+
+/* Source-over alpha blending for one 8-bit or 16-bit channel pair */
+static uint16_t apng_blend_channel(uint32_t src, uint32_t dst, uint32_t sa, uint32_t max)
+{
+    /* out = src * sa + dst * (max - sa), rounded to nearest per the APNG spec */
+    uint64_t v = (uint64_t)src * sa + (uint64_t)dst * (max - sa) + max / 2;
+    return (uint16_t)(v / max);
+}
+
+/* Composite a decoded frame region into the full-canvas buffer.
+   region points to frame_width*frame_height rows of frame_width bytes. */
+static int apng_composite(spng_ctx *ctx, const unsigned char *region,
+                          const struct spng_fctl *fctl)
+{
+    const struct spng_ihdr *ihdr = &ctx->ihdr;
+    const int fmt = ctx->fmt;
+    unsigned char *canvas = ctx->apng_canvas;
+
+    const size_t ps = apng_pixel_size(fmt);
+
+    if(!ps) return SPNG_EFMT; /* compositing is only defined for unpacked formats */
+
+    /* blend_op only has an effect for color types with an alpha channel:
+       native alpha (GA/RGBA) or tRNS-transparency (gray/RGB/indexed).
+       Without alpha every source pixel is opaque and replaces the
+       destination, so SOURCE and OVER are equivalent. */
+    const int have_alpha =
+        (ihdr->color_type == SPNG_COLOR_TYPE_GRAYSCALE_ALPHA ||
+         ihdr->color_type == SPNG_COLOR_TYPE_TRUECOLOR_ALPHA ||
+         (ctx->stored.trns &&
+          (ihdr->color_type == SPNG_COLOR_TYPE_GRAYSCALE ||
+           ihdr->color_type == SPNG_COLOR_TYPE_TRUECOLOR ||
+           ihdr->color_type == SPNG_COLOR_TYPE_INDEXED)));
+
+    const int channels16 = (fmt == SPNG_FMT_RGBA16 || fmt == SPNG_FMT_GA16);
+    const uint32_t max = channels16 ? 65535u : 255u;
+
+    /* APNG compositing is defined at the source bit depth. When a 16-bit
+       output holds an 8-bit source (samples scaled by 257), blend at 8-bit
+       precision and scale the result back up. */
+    const int blend8 = channels16 && ihdr->bit_depth == 8;
+    const uint32_t blend_max = blend8 ? 255u : max;
+
+    const size_t canvas_row = ctx->apng_image_size / ctx->ihdr.height;
+    const size_t frame_row = (size_t)fctl->width * ps;
+
+    uint32_t y;
+    for(y = 0; y < fctl->height; y++)
+    {
+        const unsigned char *sp = region + (size_t)y * frame_row;
+        unsigned char *dp = canvas +
+            ((size_t)fctl->y_offset + y) * canvas_row +
+            (size_t)fctl->x_offset * ps;
+
+        if(!have_alpha || fctl->blend_op == SPNG_BLEND_OP_SOURCE)
+        {
+            memcpy(dp, sp, frame_row);
+            continue;
+        }
+
+        uint32_t x;
+        for(x = 0; x < fctl->width; x++)
+        {
+            uint32_t sa;
+            if(channels16)
+            {
+                sa = (sp[6] << 8) | sp[7]; /* RGBA16 alpha */
+                if(fmt == SPNG_FMT_GA16) sa = (sp[2] << 8) | sp[3];
+                if(blend8) sa >>= 8;
+            }
+            else
+            {
+                sa = sp[3]; /* RGBA8/GA8 alpha */
+                if(fmt == SPNG_FMT_GA8) sa = sp[1];
+            }
+
+            if(sa == 0)
+            {
+                /* Fully transparent source leaves the destination untouched */
+            }
+            else if(sa == blend_max)
+            {
+                memcpy(dp, sp, ps);
+            }
+            else
+            {
+                /* Number of color (non-alpha) channels and the byte offset
+                   of the alpha sample within one pixel */
+                const size_t n_color = channels16 ? (ps / 2 - 1) : (ps - 1);
+                const size_t alpha_off = channels16 ?
+                    (fmt == SPNG_FMT_GA16 ? 2 : 6) :
+                    (fmt == SPNG_FMT_GA8 ? 1 : ps - 1);
+
+                unsigned c;
+                for(c = 0; c < n_color; c++)
+                {
+                    uint32_t s, d;
+                    if(channels16)
+                    {
+                        s = (sp[c*2] << 8) | sp[c*2+1];
+                        d = (dp[c*2] << 8) | dp[c*2+1];
+                        if(blend8)
+                        {
+                            /* downscale to 8-bit, blend, upscale by 257 */
+                            uint8_t r8 = (uint8_t)apng_blend_channel(
+                                s >> 8, d >> 8, sa, blend_max);
+                            uint16_t r = (uint16_t)(r8 * 257);
+                            dp[c*2] = (unsigned char)(r >> 8);
+                            dp[c*2+1] = (unsigned char)(r & 0xff);
+                        }
+                        else
+                        {
+                            uint16_t r = apng_blend_channel(s, d, sa, max);
+                            dp[c*2] = (unsigned char)(r >> 8);
+                            dp[c*2+1] = (unsigned char)(r & 0xff);
+                        }
+                    }
+                    else
+                    {
+                        s = sp[c];
+                        d = dp[c];
+                        dp[c] = (unsigned char)apng_blend_channel(s, d, sa, blend_max);
+                    }
+                }
+
+                /* Output alpha follows source-over coverage:
+                   a_out = sa + da * (1 - sa), not the color formula */
+                uint32_t da;
+                if(channels16)
+                {
+                    da = (dp[alpha_off] << 8) | dp[alpha_off + 1];
+                    if(blend8) da >>= 8;
+                }
+                else
+                {
+                    da = dp[alpha_off];
+                }
+
+                uint32_t out_a = sa + (da * (blend_max - sa) + blend_max / 2) / blend_max;
+
+                if(channels16)
+                {
+                    if(blend8) out_a *= 257;
+                    dp[alpha_off] = (unsigned char)(out_a >> 8);
+                    dp[alpha_off + 1] = (unsigned char)(out_a & 0xff);
+                }
+                else
+                {
+                    dp[alpha_off] = (unsigned char)out_a;
+                }
+            }
+
+            sp += ps;
+            dp += ps;
+        }
+    }
+
+    return 0;
+}
+
+/* Clear a frame region to fully transparent black */
+static void apng_clear_region(spng_ctx *ctx, const struct spng_fctl *fctl)
+{
+    const int fmt = ctx->fmt;
+    const size_t ps = apng_pixel_size(fmt);
+    if(!ps) return;
+
+    unsigned char *canvas = ctx->apng_canvas;
+    const size_t canvas_row = ctx->apng_image_size / ctx->ihdr.height;
+    const size_t frame_row = (size_t)fctl->width * ps;
+
+    uint32_t y;
+    for(y = 0; y < fctl->height; y++)
+    {
+        memset(canvas + ((size_t)fctl->y_offset + y) * canvas_row +
+               (size_t)fctl->x_offset * ps, 0, frame_row);
+    }
+}
+
+static int apng_save_prev_region(spng_ctx *ctx, const struct spng_fctl *fctl)
+{
+    const size_t ps = apng_pixel_size(ctx->fmt);
+    if(!ps) return SPNG_EFMT;
+
+    const size_t region_size = (size_t)fctl->width * fctl->height * ps;
+
+    if(ctx->apng_prev == NULL)
+    {
+        ctx->apng_prev = spng__malloc(ctx, region_size);
+        if(ctx->apng_prev == NULL) return SPNG_EMEM;
+    }
+
+    const size_t canvas_row = ctx->apng_image_size / ctx->ihdr.height;
+    unsigned char *dst = ctx->apng_prev;
+    const unsigned char *canvas = ctx->apng_canvas;
+
+    uint32_t y;
+    for(y = 0; y < fctl->height; y++)
+    {
+        memcpy(dst + (size_t)y * fctl->width * ps,
+               canvas + ((size_t)fctl->y_offset + y) * canvas_row +
+               (size_t)fctl->x_offset * ps,
+               (size_t)fctl->width * ps);
+    }
+
+    return 0;
+}
+
+static void apng_restore_prev_region(spng_ctx *ctx, const struct spng_fctl *fctl)
+{
+    const size_t ps = apng_pixel_size(ctx->fmt);
+    if(!ps || ctx->apng_prev == NULL) return;
+
+    const size_t canvas_row = ctx->apng_image_size / ctx->ihdr.height;
+    unsigned char *canvas = ctx->apng_canvas;
+    const unsigned char *src = ctx->apng_prev;
+
+    uint32_t y;
+    for(y = 0; y < fctl->height; y++)
+    {
+        memcpy(canvas + ((size_t)fctl->y_offset + y) * canvas_row +
+               (size_t)fctl->x_offset * ps,
+               src + (size_t)y * fctl->width * ps,
+               (size_t)fctl->width * ps);
+    }
+}
+
+int spng_decode_frame(spng_ctx *ctx, void *out, size_t len,
+                      int fmt, int flags, struct spng_fctl *fctl)
+{
+    if(ctx == NULL || fctl == NULL) return 1;
+    if(ctx->encode_only) return SPNG_ECTXTYPE;
+
+    /* The default image must have been decoded with spng_decode_image() */
+    if(ctx->state < SPNG_STATE_EOI) return SPNG_EBADSTATE;
+    if(!ctx->file.actl) return SPNG_ECHUNKAVAIL;
+
+    /* Frames share the format of the default image */
+    if(fmt != (int)ctx->fmt) return SPNG_EFMT;
+
+    int ret;
+
+    if(ctx->state == SPNG_STATE_EOI || ctx->state == SPNG_STATE_LAST_IDAT ||
+       ctx->state == SPNG_STATE_AFTER_IDAT)
+    {
+        ctx->fdat_stream = 0;
+        ctx->state = SPNG_STATE_FRAME_IDLE;
+    }
+
+    if(ctx->state == SPNG_STATE_IEND) return SPNG_EOI;
+    if(ctx->state != SPNG_STATE_FRAME_IDLE) return SPNG_EBADSTATE;
+
+    /* Read chunks until the next fcTL or IEND */
+    struct spng_chunk chunk;
+
+    for(;;)
+    {
+        ret = read_header(ctx);
+        if(ret) return decode_err(ctx, ret);
+
+        chunk = ctx->current_chunk;
+
+        if(!memcmp(chunk.type, type_iend, 4))
+        {
+            if(chunk.length) return decode_err(ctx, SPNG_ECHUNK_SIZE);
+
+            ret = read_and_check_crc(ctx);
+            if(ret == -SPNG_CRC_DISCARD) ret = 0;
+            if(ret) return decode_err(ctx, ret);
+
+            ctx->state = SPNG_STATE_IEND;
+            return SPNG_EOI;
+        }
+
+        if(!memcmp(chunk.type, type_fctl, 4))
+        {
+            if(chunk.length != 26) return decode_err(ctx, SPNG_ECHUNK_SIZE);
+
+            ret = read_chunk_bytes(ctx, chunk.length);
+            if(ret) return decode_err(ctx, ret);
+
+            const unsigned char *data = ctx->data;
+
+            if(read_u32(data) != ctx->apng_seq) return decode_err(ctx, SPNG_EAPNG);
+            ctx->apng_seq++;
+
+            parse_fctl(&ctx->fctl, data);
+
+            ret = check_fctl(&ctx->fctl, &ctx->ihdr, 0);
+            if(ret) return decode_err(ctx, ret);
+
+            /* The stream may not describe more frames than acTL declares.
+               apng_frame_idx counts frames already produced, so the frame
+               this fcTL begins is index apng_frame_idx. */
+            if(ctx->apng_frame_idx >= ctx->actl.num_frames)
+                return decode_err(ctx, SPNG_EAPNG);
+
+            ctx->stored.fctl = 1;
+            break;
+        }
+
+        /* Skip ancillary chunks and any stray IDAT between frames */
+        ret = discard_chunk_bytes(ctx, ctx->cur_chunk_bytes_left);
+        if(ret) return decode_err(ctx, ret);
+    }
+
+    *fctl = ctx->fctl;
+
+    /* Dispose the previous frame before rendering this one */
+    if(ctx->apng_compose && ctx->apng_frame_idx > 0)
+    {
+        const struct spng_fctl *prev = &ctx->apng_prev_fctl;
+
+        if(prev->dispose_op == SPNG_DISPOSE_OP_BACKGROUND)
+        {
+            apng_clear_region(ctx, prev);
+        }
+        else if(prev->dispose_op == SPNG_DISPOSE_OP_PREVIOUS)
+        {
+            apng_restore_prev_region(ctx, prev);
+        }
+    }
+
+    /* Save the region for a later DISPOSE_OP_PREVIOUS */
+    if(ctx->apng_compose && ctx->fctl.dispose_op == SPNG_DISPOSE_OP_PREVIOUS)
+    {
+        ret = apng_save_prev_region(ctx, &ctx->fctl);
+        if(ret) return decode_err(ctx, ret);
+    }
+
+    ret = calculate_frame_subimages(ctx, ctx->fctl.width, ctx->fctl.height);
+    if(ret) return decode_err(ctx, ret);
+
+    const size_t ps = apng_pixel_size(fmt);
+    struct spng_subimage *sub = ctx->subimage;
+
+    if(fmt & (SPNG_FMT_PNG | SPNG_FMT_RAW))
+    {
+        ctx->image_width = sub[0].scanline_width - 1;
+    }
+    else
+    {
+        if(!ps) return decode_err(ctx, SPNG_EFMT);
+        ctx->image_width = (size_t)ctx->fctl.width * ps;
+    }
+
+    sub[0].out_width = ctx->image_width;
+
+    if(ctx->image_width > SIZE_MAX / ctx->fctl.height) return decode_err(ctx, SPNG_EOVERFLOW);
+
+    const size_t frame_size = ctx->image_width * ctx->fctl.height;
+
+    if(!ctx->apng_compose)
+    {
+        /* Region mode: the caller's buffer must hold the full canvas,
+           only the frame's own rectangle is written to it */
+        if(len < ctx->apng_image_size) return decode_err(ctx, SPNG_EBUFSIZ);
+        memset(out, 0, ctx->apng_image_size);
+    }
+    else
+    {
+        if(len < ctx->apng_image_size) return decode_err(ctx, SPNG_EBUFSIZ);
+    }
+
+    /* Locate the first fdAT of this frame */
+    ret = read_header(ctx);
+    if(ret) return decode_err(ctx, ret);
+
+    if(memcmp(ctx->current_chunk.type, type_fdat, 4)) return decode_err(ctx, SPNG_EAPNG);
+
+    if(ctx->cur_chunk_bytes_left < 4) return decode_err(ctx, SPNG_EAPNG);
+
+    ret = read_chunk_bytes(ctx, 4);
+    if(ret) return decode_err(ctx, ret);
+
+    if(read_u32(ctx->data) != ctx->apng_seq) return decode_err(ctx, SPNG_EAPNG);
+    ctx->apng_seq++;
+
+    ctx->fdat_stream = 1;
+
+    uint32_t bytes_read;
+    if(ctx->cur_chunk_bytes_left)
+    {
+        if(ctx->streaming)
+        {
+            bytes_read = SPNG_READ_SIZE;
+            if(bytes_read > ctx->cur_chunk_bytes_left) bytes_read = ctx->cur_chunk_bytes_left;
+        }
+        else bytes_read = ctx->cur_chunk_bytes_left;
+
+        ret = read_chunk_bytes(ctx, bytes_read);
+        if(ret) return decode_err(ctx, ret);
+    }
+    else
+    {
+        ret = read_fdat_bytes(ctx, &bytes_read);
+        if(ret) return decode_err(ctx, ret);
+    }
+
+    ret = spng__inflate_init(ctx, ctx->image_options.window_bits);
+    if(ret) return decode_err(ctx, ret);
+
+    ctx->zstream.avail_in = bytes_read;
+    ctx->zstream.next_in = ctx->data;
+
+    /* Replace the scanline buffers with ones sized for this frame */
+    size_t scanline_buf_size = sub[ctx->widest_pass].scanline_width + 32;
+    if(scanline_buf_size < 32) return decode_err(ctx, SPNG_EOVERFLOW);
+
+    spng__free(ctx, ctx->scanline_buf);
+    spng__free(ctx, ctx->prev_scanline_buf);
+    spng__free(ctx, ctx->row_buf);
+
+    ctx->scanline_buf = spng__calloc(ctx, 1, scanline_buf_size);
+    ctx->prev_scanline_buf = spng__calloc(ctx, 1, scanline_buf_size);
+
+    ctx->scanline = ctx->scanline_buf;
+    ctx->prev_scanline = ctx->prev_scanline_buf;
+    ctx->row_buf = NULL;
+    ctx->row = NULL;
+
+    if(ctx->scanline == NULL || ctx->prev_scanline == NULL)
+        return decode_err(ctx, SPNG_EMEM);
+
+    memset(&ctx->row_info, 0, sizeof(struct spng_row_info));
+
+    ctx->state = SPNG_STATE_DECODE_INIT;
+
+    ret = read_scanline_bytes(ctx, &ctx->row_info.filter, 1);
+    if(ret) return decode_err(ctx, ret);
+
+    if(ctx->row_info.filter > 4) return decode_err(ctx, SPNG_EFILTER);
+
+    if(flags & SPNG_DECODE_PROGRESSIVE)
+    {
+        return 0;
+    }
+
+    /* Decode the frame into a temporary region buffer */
+    unsigned char *region = spng__malloc(ctx, frame_size);
+    if(region == NULL) return decode_err(ctx, SPNG_EMEM);
+
+    do
+    {
+        size_t ioffset = ctx->row_info.row_num * ctx->image_width;
+
+        ret = spng_decode_row(ctx, region + ioffset, ctx->image_width);
+    }while(!ret);
+
+    if(ret != SPNG_EOI)
+    {
+        spng__free(ctx, region);
+        return decode_err(ctx, ret);
+    }
+
+    ctx->state = SPNG_STATE_FRAME_IDLE;
+    ctx->fdat_stream = 0;
+
+    if(ctx->apng_compose)
+    {
+        ret = apng_composite(ctx, region, &ctx->fctl);
+        if(ret)
+        {
+            spng__free(ctx, region);
+            return decode_err(ctx, ret);
+        }
+
+        memcpy(out, ctx->apng_canvas, ctx->apng_image_size);
+    }
+    else
+    {
+        /* Place the frame at its offset inside the otherwise-zeroed buffer */
+        if(fmt & (SPNG_FMT_PNG | SPNG_FMT_RAW))
+        {
+            if(ctx->fctl.x_offset || ctx->fctl.y_offset)
+            {
+                spng__free(ctx, region);
+                return decode_err(ctx, SPNG_EAPNG);
+            }
+            memcpy(out, region, frame_size);
+        }
+        else
+        {
+            const size_t canvas_row = ctx->apng_image_size / ctx->ihdr.height;
+            uint32_t y;
+            for(y = 0; y < ctx->fctl.height; y++)
+            {
+                memcpy((unsigned char*)out +
+                       ((size_t)ctx->fctl.y_offset + y) * canvas_row +
+                       (size_t)ctx->fctl.x_offset * ps,
+                       region + (size_t)y * ctx->image_width,
+                       ctx->image_width);
+            }
+        }
+    }
+
+    spng__free(ctx, region);
+
+    ctx->apng_prev_fctl = ctx->fctl;
+    ctx->apng_frame_idx++;
 
     return 0;
 }
@@ -5004,6 +5758,9 @@ void spng_ctx_free(spng_ctx *ctx)
     spng__free(ctx, ctx->prev_scanline_buf);
     spng__free(ctx, ctx->filtered_scanline_buf);
 
+    spng__free(ctx, ctx->apng_canvas);
+    spng__free(ctx, ctx->apng_prev);
+
     spng_free_fn *free_fn = ctx->alloc.free_fn;
 
     memset(ctx, 0, sizeof(spng_ctx));
@@ -5605,6 +6362,24 @@ int spng_get_exif(spng_ctx *ctx, struct spng_exif *exif)
     return 0;
 }
 
+int spng_get_actl(spng_ctx *ctx, struct spng_actl *actl)
+{
+    SPNG_GET_CHUNK_BOILERPLATE(actl);
+
+    *actl = ctx->actl;
+
+    return 0;
+}
+
+int spng_get_frame_fctl(spng_ctx *ctx, struct spng_fctl *fctl)
+{
+    SPNG_GET_CHUNK_BOILERPLATE(fctl);
+
+    *fctl = ctx->fctl;
+
+    return 0;
+}
+
 int spng_set_ihdr(spng_ctx *ctx, struct spng_ihdr *ihdr)
 {
     SPNG_SET_CHUNK_BOILERPLATE(ihdr);
@@ -6134,6 +6909,10 @@ const char *spng_strerror(int err)
         case SPNG_ENODST: return "PNG output not set";
         case SPNG_EOPSTATE: return "invalid operation for state";
         case SPNG_ENOTFINAL: return "PNG not finalized";
+        case SPNG_EACTL: return "invalid acTL chunk";
+        case SPNG_EFCTL: return "invalid fcTL chunk";
+        case SPNG_EDUP_ACTL: return "duplicate acTL chunk";
+        case SPNG_EAPNG: return "APNG error";
         default: return "unknown error";
     }
 }
