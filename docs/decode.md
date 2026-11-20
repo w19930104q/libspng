@@ -25,6 +25,7 @@ enum spng_decode_flags
 
     SPNG_DECODE_TRNS = 1, /* Apply transparency */
     SPNG_DECODE_GAMMA = 2, /* Apply gamma correction */
+    SPNG_DECODE_USE_SBIT = 8, /* Apply sBIT scaling */
     SPNG_DECODE_PROGRESSIVE = 256 /* Initialize for progressive reads */
 };
 ```
@@ -205,6 +206,34 @@ the values of `out`, `len` are ignored.
 
 The `SPNG_DECODE_TRNS` flag is silently ignored if the PNG does not
 contain a tRNS chunk or is not applicable for the color type.
+
+The `SPNG_DECODE_USE_SBIT` flag applies significant-bits scaling based on the
+PNG `sBIT` chunk. Each stored sample is shifted down to its significant bit
+depth and then expanded back up to the output bit depth using PNG 1.2
+[left bit replication](https://www.w3.org/TR/2003/REC-PNG-20031110/#13Sample-depth-scaling),
+so that an all-ones significant value maps to the maximum output value
+(for example a 5-bit value of 31 expands to 255 in 8-bit output and 65535 in
+16-bit output). This matches the semantics of libpng's `png_set_shift()`
+together with its bit-replication expansion.
+
+The flag is silently ignored when the image has no `sBIT` chunk; output is
+then identical to a decode without the flag.
+
+Bit-depth combinations are handled as follows:
+
+* An 8-bit source expanded to a 16-bit output replicates the significant bits
+  directly to 16 bits.
+* A 16-bit source truncated to an 8-bit output loses the low byte first; if the
+  significant bit count is above 8 it is reduced by 8, otherwise the remaining
+  8-bit sample is treated as fully significant since the truncated low bits are
+  unrecoverable.
+* Indexed (palette) images always store 8-bit entries regardless of the index
+  bit depth. For `SPNG_FMT_RGBA16` the entries replicate their significant bits
+  directly to 16 bits rather than scaling to 8 bits and duplicating the byte,
+  which would lose precision when the significant bit count does not divide 8.
+
+An invalid `sBIT` chunk (zero count or a count above the source bit depth)
+causes decoding to fail with `SPNG_ESBIT`.
 
 This function can only be called once per context.
 

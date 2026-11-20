@@ -39,6 +39,7 @@ test('cpp_test', cpp_exe)
 subdir('images')
 subdir('crashers')
 subdir('misc')
+subdir('sbit')
 
 if get_option('oss_fuzz') == false
     subdir_done()

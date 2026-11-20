@@ -357,6 +357,7 @@ struct spng_ctx
     unsigned char trns_px[8];
     union spng__decode_plte decode_plte;
     struct spng_sbit decode_sb;
+    unsigned processing_depth; /* sample depth after strip/pad, sBIT domain */
     struct decode_flags decode_flags;
     struct spng_row_info row_info;
 
@@ -1708,34 +1709,36 @@ static unsigned get_best_filter(const unsigned char *prev_scanline, const unsign
    "bit_depth" must be a valid PNG depth
    "sbits" must be less than or equal to "bit_depth"
    "target" must be between 1 and 16
+
+   Upscaling uses left bit replication as recommended by the PNG specification,
+   e.g. a 5-bit value of 31 (11111) expanded to 8 bits becomes 255 (11111111)
+   and to 16 bits becomes 65535 (1111111111111111). This matches the bit
+   replication in libpng's png_do_shift().
 */
 static uint16_t sample_to_target(uint16_t sample, unsigned bit_depth, unsigned sbits, unsigned target)
 {
-    if(bit_depth == sbits)
+    uint32_t value = sample;
+
+    if(bit_depth > sbits) value >>= (bit_depth - sbits); /* shift significant bits to bottom */
+
+    if(target < sbits) return (uint16_t)(value >> (sbits - target)); /* downscale */
+
+    if(target == sbits) return (uint16_t)value;
+
+    /* Upscale using left bit replication.
+       A 32-bit accumulator is required because replicating a small number of
+       significant bits up to a 16-bit target shifts the value beyond 16 bits
+       partway through, which would overflow a 16-bit intermediate. */
+    uint32_t out = 0;
+    int shift_amount = (int)(target - sbits);
+
+    for(; shift_amount > -(int)sbits; shift_amount -= (int)sbits)
     {
-        if(target == sbits) return sample; /* No scaling */
-    }/* bit_depth > sbits */
-    else sample = sample >> (bit_depth - sbits); /* Shift significant bits to bottom */
-
-    /* Downscale */
-    if(target < sbits) return sample >> (sbits - target);
-
-    /* Upscale using left bit replication */
-    int8_t shift_amount = target - sbits;
-    uint16_t sample_bits = sample;
-    sample = 0;
-
-    while(shift_amount >= 0)
-    {
-        sample = sample | (sample_bits << shift_amount);
-        shift_amount -= sbits;
+        if(shift_amount > 0) out |= value << shift_amount;
+        else out |= value >> (-shift_amount);
     }
 
-    int8_t partial = shift_amount + (int8_t)sbits;
-
-    if(partial != 0) sample = sample | (sample_bits >> abs(shift_amount));
-
-    return sample;
+    return (uint16_t)(out & 0xFFFFu);
 }
 
 static inline void gamma_correct_row(unsigned char *row, uint32_t pixels, int fmt, const uint16_t *gamma_lut)
@@ -1860,6 +1863,10 @@ static inline void trns_row(unsigned char *row,
     else return;
 }
 
+/* Apply sBIT scaling to a decoded output row.
+   "depth" is the bit depth of the samples as produced by the decode loop for
+   the given output format, "sbit" holds the significant bit counts in that
+   same depth domain (both are prepared by spng_decode_image()). */
 static inline void scale_row(unsigned char *row, uint32_t pixels, int fmt, unsigned depth, const struct spng_sbit *sbit)
 {
     uint32_t i;
@@ -1920,6 +1927,21 @@ static inline void scale_row(unsigned char *row, uint32_t pixels, int fmt, unsig
         for(i=0; i < pixels; i++)
         {
             row[i*2] = sample_to_target(row[i*2], depth, sbit->grayscale_bits, 8);
+        }
+    }
+    else if(fmt == SPNG_FMT_GA16)
+    {
+        uint16_t gray, alpha;
+        for(i=0; i < pixels; i++)
+        {
+            memcpy(&gray, row + i * 4, 2);
+            memcpy(&alpha, row + i * 4 + 2, 2);
+
+            gray = sample_to_target(gray, depth, sbit->grayscale_bits, 16);
+            alpha = sample_to_target(alpha, depth, sbit->alpha_bits, 16);
+
+            memcpy(row + i * 4, &gray, 2);
+            memcpy(row + i * 4 + 2, &alpha, 2);
         }
     }
 }
@@ -3319,9 +3341,7 @@ int spng_decode_scanline(spng_ctx *ctx, void *out, size_t len)
     size_t pixel_size = 4; /* SPNG_FMT_RGBA8 */
     size_t pixel_offset = 0;
     unsigned char *pixel;
-    unsigned processing_depth = ihdr->bit_depth;
-
-    if(f.indexed) processing_depth = 8;
+    unsigned processing_depth = ctx->processing_depth;
 
     if(fmt == SPNG_FMT_RGBA16) pixel_size = 8;
     else if(fmt == SPNG_FMT_RGB8) pixel_size = 3;
@@ -3408,15 +3428,28 @@ int spng_decode_scanline(spng_ctx *ctx, void *out, size_t len)
             }
             else /* RGBA16 */
             {
-                r_16 = plte[entry].red;
-                g_16 = plte[entry].green;
-                b_16 = plte[entry].blue;
-                a_16 = plte[entry].alpha;
+                if(f.use_sbit)
+                {/* Replicate directly from the significant bits up to 16.
+                    The palette entries were left at their stored 8-bit values
+                    (see spng_decode_image()), so scaling them in two steps via
+                    8-bit byte replication would lose precision. */
+                    r_16 = sample_to_target(plte[entry].red, 8, sb->red_bits, 16);
+                    g_16 = sample_to_target(plte[entry].green, 8, sb->green_bits, 16);
+                    b_16 = sample_to_target(plte[entry].blue, 8, sb->blue_bits, 16);
+                    a_16 = sample_to_target(plte[entry].alpha, 8, sb->alpha_bits, 16);
+                }
+                else
+                {
+                    r_16 = plte[entry].red;
+                    g_16 = plte[entry].green;
+                    b_16 = plte[entry].blue;
+                    a_16 = plte[entry].alpha;
 
-                r_16 = (r_16 << 8) | r_16;
-                g_16 = (g_16 << 8) | g_16;
-                b_16 = (b_16 << 8) | b_16;
-                a_16 = (a_16 << 8) | a_16;
+                    r_16 = (r_16 << 8) | r_16;
+                    g_16 = (g_16 << 8) | g_16;
+                    b_16 = (b_16 << 8) | b_16;
+                    a_16 = (a_16 << 8) | a_16;
+                }
 
                 memcpy(pixel, &r_16, 2);
                 memcpy(pixel + 2, &g_16, 2);
@@ -3822,39 +3855,51 @@ int spng_decode_image(spng_ctx *ctx, void *out, size_t len, int fmt, int flags)
 
     if(f.use_sbit)
     {
-        if(ihdr->color_type == 0)
+        if(ihdr->color_type == SPNG_COLOR_TYPE_GRAYSCALE)
         {
             sb->grayscale_bits = ctx->sbit.grayscale_bits;
-            sb->alpha_bits = ihdr->bit_depth;
         }
-        else if(ihdr->color_type == 2 || ihdr->color_type == 3)
+        else if(ihdr->color_type == SPNG_COLOR_TYPE_TRUECOLOR ||
+                ihdr->color_type == SPNG_COLOR_TYPE_INDEXED)
         {
             sb->red_bits = ctx->sbit.red_bits;
             sb->green_bits = ctx->sbit.green_bits;
             sb->blue_bits = ctx->sbit.blue_bits;
-            sb->alpha_bits = ihdr->bit_depth;
         }
-        else if(ihdr->color_type == 4)
+        else if(ihdr->color_type == SPNG_COLOR_TYPE_GRAYSCALE_ALPHA)
         {
             sb->grayscale_bits = ctx->sbit.grayscale_bits;
             sb->alpha_bits = ctx->sbit.alpha_bits;
         }
-        else /* == 6 */
+        else /* SPNG_COLOR_TYPE_TRUECOLOR_ALPHA */
         {
             sb->red_bits = ctx->sbit.red_bits;
             sb->green_bits = ctx->sbit.green_bits;
             sb->blue_bits = ctx->sbit.blue_bits;
             sb->alpha_bits = ctx->sbit.alpha_bits;
+        }
+
+        /* Grayscale is expanded into the red, green and blue channels for
+           SPNG_FMT_RGBA8/RGBA16/RGB8, they inherit the grayscale sBIT. */
+        if(ihdr->color_type == SPNG_COLOR_TYPE_GRAYSCALE ||
+           ihdr->color_type == SPNG_COLOR_TYPE_GRAYSCALE_ALPHA)
+        {
+            sb->red_bits = sb->grayscale_bits;
+            sb->green_bits = sb->grayscale_bits;
+            sb->blue_bits = sb->grayscale_bits;
         }
     }
 
     if(ihdr->bit_depth == 16 && fmt & (SPNG_FMT_RGBA8 | SPNG_FMT_RGB8))
-    {/* samples are scaled down by 8 bits in the decode loop */
-        sb->red_bits -= 8;
-        sb->green_bits -= 8;
-        sb->blue_bits -= 8;
-        sb->alpha_bits -= 8;
-        sb->grayscale_bits -= 8;
+    {/* 16-bit samples are truncated to their high 8 bits in the decode loop.
+        An sBIT count above 8 loses 8 significant bits in the process; when all
+        significant bits were in the truncated low half the remaining 8-bit
+        sample is treated as fully significant, the low bits are unrecoverable. */
+        if(sb->red_bits > 8) sb->red_bits -= 8; else sb->red_bits = 8;
+        if(sb->green_bits > 8) sb->green_bits -= 8; else sb->green_bits = 8;
+        if(sb->blue_bits > 8) sb->blue_bits -= 8; else sb->blue_bits = 8;
+        if(sb->alpha_bits > 8) sb->alpha_bits -= 8; else sb->alpha_bits = 8;
+        if(sb->grayscale_bits > 8) sb->grayscale_bits -= 8; else sb->grayscale_bits = 8;
 
         processing_depth = 8;
     }
@@ -3871,6 +3916,8 @@ int spng_decode_image(spng_ctx *ctx, void *out, size_t len, int fmt, int flags)
         return decode_err(ctx, SPNG_ESBIT);
     }
 
+    ctx->processing_depth = processing_depth;
+
     if(sb->red_bits == sb->green_bits &&
        sb->green_bits == sb->blue_bits &&
        sb->blue_bits == sb->alpha_bits &&
@@ -3884,6 +3931,14 @@ int spng_decode_image(spng_ctx *ctx, void *out, size_t len, int fmt, int flags)
     {
         uint8_t red, green, blue, alpha;
 
+        /* Palette entries are always 8-bit. For an 8-bit target the entries
+           are scaled in place; for a 16-bit target (SPNG_FMT_RGBA16) the raw
+           entries are kept and replicated directly from the significant bits
+           to 16 bits in the decode loop, since scaling to 8 bits first would
+           discard the replication remainder (e.g. 3 significant bits cannot
+           be represented exactly in 8 bits). */
+        int scale_palette = !(f.use_sbit && fmt == SPNG_FMT_RGBA16);
+
         uint32_t i;
         for(i=0; i < 256; i++)
         {
@@ -3892,10 +3947,20 @@ int spng_decode_image(spng_ctx *ctx, void *out, size_t len, int fmt, int flags)
             else
                 ctx->plte.entries[i].alpha = 255;
 
-            red   = sample_to_target(ctx->plte.entries[i].red, 8, sb->red_bits, 8);
-            green = sample_to_target(ctx->plte.entries[i].green, 8, sb->green_bits, 8);
-            blue  = sample_to_target(ctx->plte.entries[i].blue, 8, sb->blue_bits, 8);
-            alpha = sample_to_target(ctx->plte.entries[i].alpha, 8, sb->alpha_bits, 8);
+            if(scale_palette)
+            {
+                red   = sample_to_target(ctx->plte.entries[i].red, 8, sb->red_bits, 8);
+                green = sample_to_target(ctx->plte.entries[i].green, 8, sb->green_bits, 8);
+                blue  = sample_to_target(ctx->plte.entries[i].blue, 8, sb->blue_bits, 8);
+                alpha = sample_to_target(ctx->plte.entries[i].alpha, 8, sb->alpha_bits, 8);
+            }
+            else
+            {
+                red   = ctx->plte.entries[i].red;
+                green = ctx->plte.entries[i].green;
+                blue  = ctx->plte.entries[i].blue;
+                alpha = ctx->plte.entries[i].alpha;
+            }
 
 #if defined(SPNG_ARM)
             if(fmt == SPNG_FMT_RGB8 && ihdr->bit_depth == 8)

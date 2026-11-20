@@ -189,12 +189,17 @@ enum spng_ctx_flags
 
 enum spng_decode_flags
 {
-    SPNG_DECODE_USE_TRNS = 1, /* Deprecated */
-    SPNG_DECODE_USE_GAMA = 2, /* Deprecated */
-    SPNG_DECODE_USE_SBIT = 8, /* Undocumented */
+    SPNG_DECODE_USE_TRNS = 1, /* Deprecated, use SPNG_DECODE_TRNS */
+    SPNG_DECODE_USE_GAMA = 2, /* Deprecated, use SPNG_DECODE_GAMMA */
 
     SPNG_DECODE_TRNS = 1, /* Apply transparency */
     SPNG_DECODE_GAMMA = 2, /* Apply gamma correction */
+    /* Apply sBIT scaling: each sample is shifted down to its significant bit
+       depth given by the sBIT chunk, then the significant bits are replicated
+       back up to the output bit depth using PNG 1.2 left bit replication.
+       No effect when the image has no sBIT chunk. Palette entries are always
+       8-bit and, for SPNG_FMT_RGBA16, replicate directly to 16 bits. */
+    SPNG_DECODE_USE_SBIT = 8,
     SPNG_DECODE_PROGRESSIVE = 256 /* Initialize for progressive reads */
 };
 
