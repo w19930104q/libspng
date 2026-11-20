@@ -383,6 +383,12 @@ static const uint8_t type_gama[4] = { 103, 65, 77, 65 };
 static const uint8_t type_iccp[4] = { 105, 67, 67, 80 };
 static const uint8_t type_sbit[4] = { 115, 66, 73, 84 };
 static const uint8_t type_srgb[4] = { 115, 82, 71, 66 };
+
+/* PNG 1.2 (13.13): when the sRGB chunk is present the image is implicitly
+   gamma-encoded with the sRGB transfer function, i.e. a file gamma of
+   1/0.45455.  This takes precedence over any gAMA chunk, an iCCP chunk
+   does not provide a gamma value for this approximation. */
+static const uint32_t spng_srgb_gama = 45455;
 static const uint8_t type_text[4] = { 116, 69, 88, 116 };
 static const uint8_t type_ztxt[4] = { 122, 84, 88, 116 };
 static const uint8_t type_itxt[4] = { 105, 84, 88, 116 };
@@ -3719,7 +3725,13 @@ int spng_decode_image(spng_ctx *ctx, void *out, size_t len, int fmt, int flags)
     if(ihdr->color_type == SPNG_COLOR_TYPE_GRAYSCALE_ALPHA ||
        ihdr->color_type == SPNG_COLOR_TYPE_TRUECOLOR_ALPHA) flags &= ~SPNG_DECODE_TRNS;
 
-    if(flags & SPNG_DECODE_GAMMA && ctx->stored.gama) f.apply_gamma = 1;
+    /* PNG color-space chunk precedence (PNG 1.2 13.13 / PNG Third Edition):
+       the sRGB chunk takes precedence over gAMA, an iCCP chunk is ignored by
+       this approximation because the embedded profile cannot be interpreted
+       without a color management system.  Fall back to gAMA when neither is
+       present, otherwise no correction is applied. */
+    if(flags & SPNG_DECODE_GAMMA && (ctx->stored.srgb || ctx->stored.gama))
+        f.apply_gamma = 1;
     else flags &= ~SPNG_DECODE_GAMMA;
 
     if(flags & SPNG_DECODE_USE_SBIT && ctx->stored.sbit) f.use_sbit = 1;
@@ -3770,7 +3782,9 @@ int spng_decode_image(spng_ctx *ctx, void *out, size_t len, int fmt, int flags)
 
     if(f.apply_gamma)
     {
-        float file_gamma = (float)ctx->gama / 100000.0f;
+        /* sRGB wins over gAMA per the PNG color-space chunk precedence */
+        uint32_t effective_gama = ctx->stored.srgb ? spng_srgb_gama : ctx->gama;
+        float file_gamma = (float)effective_gama / 100000.0f;
         float max;
 
         unsigned lut_entries;

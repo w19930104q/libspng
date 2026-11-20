@@ -116,6 +116,24 @@ Decoding an image requires at least 2 rows to be kept in memory,
 Gamma correction requires an additional 128KB for a lookup table if
 the output format has 16 bits per channel (e.g. `SPNG_FMT_RGBA16`).
 
+### Color-space chunk precedence
+
+When `SPNG_DECODE_GAMMA` is requested the file gamma used for the correction
+follows the PNG color-space chunk precedence rules ([PNG 1.2, 13.13](https://www.w3.org/TR/2003/REC-PNG-20031110/#13Decoders)):
+
+1. If the `sRGB` chunk is present the image is treated as sRGB-encoded and a
+   file gamma of `1/0.45455` is used. This takes precedence over any `gAMA`
+   chunk, even when the two disagree.
+2. Otherwise, if a `gAMA` chunk is present its value is used.
+3. An `iCCP` chunk does not provide a gamma value for this approximation
+   because the embedded ICC profile can only be interpreted by a color
+   management system; it is therefore ignored when choosing the correction.
+4. If none of `sRGB`/`gAMA` are present no correction is applied and the
+   flag has no effect.
+
+The `sRGB` rendering intent is always exposed verbatim through
+[`spng_get_srgb()`](chunk.md#spng_get_srgb).
+
 To limit memory usage for image decoding use `spng_set_image_limits()`
 to set an image width/height limit.
 This is the equivalent of `png_set_user_limits()`.

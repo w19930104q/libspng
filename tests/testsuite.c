@@ -660,7 +660,22 @@ static int compare_chunks(spng_ctx *ctx, png_infop info_ptr, png_structp png_ptr
 
         png_get_gAMA_fixed(png_ptr, info_ptr, &png_fgamna);
 
-        if(spng.gamma_int != png_fgamna)
+        /* After png_read_update_info() libpng overwrites the reported gAMA
+           value with the effective file gamma resolved through the PNG
+           color-space chunk precedence rules: when sRGB is present it
+           overrides the stored gAMA (PNG 1.2 13.13).  The raw stored value
+           was already compared before IDAT, here verify the resolved value.
+           45455 is the PNG fixed-point encoding of 1/0.45455, the sRGB
+           inverse gamma (libpng's private PNG_GAMMA_sRGB_INVERSE). */
+        if(after_idat && spng.have.srgb)
+        {
+            if(png_fgamna != 45455)
+            {
+                printf("effective sRGB gamma value mismatch\n");
+                ret = 1;
+            }
+        }
+        else if(spng.gamma_int != png_fgamna)
         {
             printf("gamma values not identical\n");
             ret = 1;

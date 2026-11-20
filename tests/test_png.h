@@ -107,8 +107,18 @@ unsigned char *getimage_libpng(png_structp png_ptr, png_infop info_ptr, size_t *
 
     if(flags & SPNG_DECODE_GAMMA)
     {
-        double gamma;
-        if(png_get_gAMA(png_ptr, info_ptr, &gamma))
+        /* Match the PNG color-space chunk precedence implemented in libspng:
+           sRGB implies a file gamma of 1/0.45455 and overrides gAMA; an iCCP
+           chunk does not provide a gamma value, so gAMA is used when sRGB is
+           absent. Without either chunk no correction is requested. */
+        double gamma = 0.0;
+
+        if(png_get_valid(png_ptr, info_ptr, PNG_INFO_sRGB))
+            gamma = 0.45455;
+        else if(png_get_valid(png_ptr, info_ptr, PNG_INFO_gAMA))
+            png_get_gAMA(png_ptr, info_ptr, &gamma);
+
+        if(gamma > 0.0)
             png_set_gamma(png_ptr, 2.2, gamma);
     }
 
