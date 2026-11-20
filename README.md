@@ -135,8 +135,8 @@ Online documentation is available at [libspng.org/docs](https://libspng.org/docs
 
 ## Known Issues
 
-* Decoding to `SPNG_FMT_G8`, `SPNG_FMT_GA8` and `SPNG_FMT_GA16` output formats is not supported
- for all PNG color type and bit depth combinations, see documentation for details.
+* Decoding to `SPNG_FMT_G8`, `SPNG_FMT_GA8` and `SPNG_FMT_GA16` output formats is limited to
+ grayscale and grayscale-alpha images, see documentation for details.
 * Gamma correction is not implemented for `SPNG_FMT_PNG`, `SPNG_FMT_G8`, `SPNG_FMT_GA8`
  and `SPNG_FMT_GA16` output formats.
 

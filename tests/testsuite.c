@@ -227,32 +227,8 @@ static int compare_images(const struct spng_ihdr *ihdr,
             }
             else if(fmt & (SPNG_FMT_PNG | SPNG_FMT_RAW | SPNG_FMT_G8 | SPNG_FMT_GA8 | SPNG_FMT_GA16))
             {
-                if(ihdr->bit_depth <= 8) /* gray 1-8, gray-alpha 8, indexed 1-8 */
-                {
-                    uint8_t s_alpha, s_sample;
-                    uint8_t p_alpha, p_sample;
-
-                    memcpy(&s_sample, img_spng + px_ofs, 1);
-                    memcpy(&p_sample, img_png + px_ofs, 1);
-
-                    shift_amount = 8 - ihdr->bit_depth - (x * ihdr->bit_depth) % 8;
-
-                    s_sample = (s_sample >> shift_amount) & mask;
-                    p_sample = (p_sample >> shift_amount) & mask;
-
-                    spng_sample = s_sample;
-                    png_sample = p_sample;
-
-                   if(have_alpha)
-                    {
-                        memcpy(&s_alpha, img_spng + px_ofs + 1, 1);
-                        memcpy(&p_alpha, img_png + px_ofs + 1, 1);
-                        spng_alpha = s_alpha;
-                        png_alpha = p_alpha;
-                    }
-                }
-                else /* gray 16, gray-alpha 16 */
-                {
+                if(fmt == SPNG_FMT_GA16 || (fmt & (SPNG_FMT_PNG | SPNG_FMT_RAW) && ihdr->bit_depth == 16))
+                {/* gray 16, gray-alpha 16 */
                     uint16_t s_alpha, s_sample;
                     uint16_t p_alpha, p_sample;
 
@@ -266,6 +242,33 @@ static int compare_images(const struct spng_ihdr *ihdr,
                     {
                         memcpy(&s_alpha, img_spng + px_ofs + 2, 2);
                         memcpy(&p_alpha, img_png + px_ofs + 2, 2);
+                        spng_alpha = s_alpha;
+                        png_alpha = p_alpha;
+                    }
+                }
+                else /* gray 1-8, gray-alpha 8, indexed 1-8 */
+                {
+                    uint8_t s_alpha, s_sample;
+                    uint8_t p_alpha, p_sample;
+
+                    memcpy(&s_sample, img_spng + px_ofs, 1);
+                    memcpy(&p_sample, img_png + px_ofs, 1);
+
+                    if(fmt & (SPNG_FMT_PNG | SPNG_FMT_RAW) && ihdr->bit_depth < 8)
+                    {/* Samples are packed */
+                        shift_amount = 8 - ihdr->bit_depth - (x * ihdr->bit_depth) % 8;
+
+                        s_sample = (s_sample >> shift_amount) & mask;
+                        p_sample = (p_sample >> shift_amount) & mask;
+                    }
+
+                    spng_sample = s_sample;
+                    png_sample = p_sample;
+
+                   if(have_alpha)
+                    {
+                        memcpy(&s_alpha, img_spng + px_ofs + 1, 1);
+                        memcpy(&p_alpha, img_png + px_ofs + 1, 1);
                         spng_alpha = s_alpha;
                         png_alpha = p_alpha;
                     }
@@ -1339,9 +1342,13 @@ int main(int argc, char **argv)
     /* https://github.com/randy408/libspng/issues/17 */
     if(ihdr.color_type == SPNG_COLOR_TYPE_GRAYSCALE) gamma_bug = SPNGT_SKIP;
 
-    /* Some output formats are limited to certain PNG formats */
-    if(ihdr.color_type == SPNG_COLOR_TYPE_GRAYSCALE && ihdr.bit_depth <= 8) fmt_limit = 0;
-    if(ihdr.color_type == SPNG_COLOR_TYPE_GRAYSCALE && ihdr.bit_depth == 16) fmt_limit_2 = 0;
+    /* Gray output formats are limited to grayscale and grayscale-alpha PNG's */
+    if(ihdr.color_type == SPNG_COLOR_TYPE_GRAYSCALE ||
+       ihdr.color_type == SPNG_COLOR_TYPE_GRAYSCALE_ALPHA)
+    {
+        fmt_limit = 0;
+        fmt_limit_2 = 0;
+    }
 
     add_test_case(SPNG_FMT_PNG, 0, SPNGT_COMPARE_CHUNKS);
     add_test_case(SPNG_FMT_PNG, 0, SPNGT_ENCODE_ROUNDTRIP | skip_encode);
@@ -1358,7 +1365,7 @@ int main(int argc, char **argv)
     add_test_case(SPNG_FMT_GA8, 0, fmt_limit);
     add_test_case(SPNG_FMT_GA8, SPNG_DECODE_TRNS, fmt_limit);
 
-    add_test_case(SPNG_FMT_GA16, 0, fmt_limit_2);
+    /* png_set_expand_16() always expands tRNS, only test with transparency applied */
     add_test_case(SPNG_FMT_GA16, SPNG_DECODE_TRNS, fmt_limit_2);
 
     /* This tests the input->output format logic used in libvips,

@@ -210,16 +210,16 @@ This function can only be called once per context.
 
 ## Supported format, flag combinations
 
-| PNG Format   | Output format     | Flags  | Notes                                         |
-|--------------|-------------------|--------|-----------------------------------------------|
-| Any format*  | `SPNG_FMT_RGBA8`  | All    | Convert from any PNG format and bit depth     |
-| Any format   | `SPNG_FMT_RGBA16` | All    | Convert from any PNG format and bit depth     |
-| Any format   | `SPNG_FMT_RGB8`   | All    | Convert from any PNG format and bit depth     |
-| Gray <=8-bit | `SPNG_FMT_G8`     | None** | Only valid for 1, 2, 4, 8-bit grayscale PNG's |
-| Gray 16-bit  | `SPNG_FMT_GA16`   | All**  | Only valid for 16-bit grayscale PNG's         |
-| Gray <=8-bit | `SPNG_FMT_GA8`    | All**  | Only valid for 1, 2, 4, 8-bit grayscale PNG's |
-| Any format   | `SPNG_FMT_PNG`    | None** | The PNG's format in host-endian               |
-| Any format   | `SPNG_FMT_RAW`    | None   | The PNG's format in big-endian                |
+| PNG Format       | Output format     | Flags  | Notes                                             |
+|------------------|-------------------|--------|---------------------------------------------------|
+| Any format*      | `SPNG_FMT_RGBA8`  | All    | Convert from any PNG format and bit depth         |
+| Any format       | `SPNG_FMT_RGBA16` | All    | Convert from any PNG format and bit depth         |
+| Any format       | `SPNG_FMT_RGB8`   | All    | Convert from any PNG format and bit depth         |
+| Gray, gray-alpha | `SPNG_FMT_G8`     | All**  | Any bit depth, alpha channel is dropped           |
+| Gray, gray-alpha | `SPNG_FMT_GA8`    | All**  | Any bit depth                                     |
+| Gray, gray-alpha | `SPNG_FMT_GA16`   | All**  | Any bit depth                                     |
+| Any format       | `SPNG_FMT_PNG`    | None** | The PNG's format in host-endian                   |
+| Any format       | `SPNG_FMT_RAW`    | None   | The PNG's format in big-endian                    |
 
 
 \* Any combination of color type and bit depth defined in the [standard](https://www.w3.org/TR/2003/REC-PNG-20031110/#table111).
@@ -230,6 +230,30 @@ The `SPNG_DECODE_PROGRESSIVE` flag is supported in all cases.
 
 The alpha channel is always [straight alpha](https://en.wikipedia.org/wiki/Alpha_compositing#Straight_versus_premultiplied),
 premultiplied alpha is not supported.
+
+### Grayscale output formats
+
+`SPNG_FMT_G8`, `SPNG_FMT_GA8` and `SPNG_FMT_GA16` are valid for grayscale and
+grayscale-alpha PNG's at any bit depth, the conversion rules are identical to
+the RGBA formats:
+
+* 1, 2 and 4-bit samples are scaled up to the output bit depth by left
+  bit-replication, e.g. a 1-bit sample of `1` becomes `255` for 8-bit output
+  and `65535` for 16-bit output.
+* 16-bit images converted to `SPNG_FMT_G8` or `SPNG_FMT_GA8` are scaled down
+  to 8 bits per channel by taking the most significant byte of each sample.
+* 8-bit images converted to `SPNG_FMT_GA16` are scaled up to 16 bits per
+  channel (`sample * 257`).
+* For grayscale-alpha images the alpha channel is preserved by
+  `SPNG_FMT_GA8`/`SPNG_FMT_GA16` and dropped by `SPNG_FMT_G8`.
+* With the `SPNG_DECODE_TRNS` flag the alpha channel of `SPNG_FMT_GA8` and
+  `SPNG_FMT_GA16` output is set to zero for pixels matching the tRNS chunk's
+  gray sample, and to the maximum value otherwise. The flag has no effect
+  with `SPNG_FMT_G8`.
+
+This means `SPNG_FMT_G8` output is identical to the red channel of
+`SPNG_FMT_RGBA8` output, `SPNG_FMT_GA8` to its red and alpha channels, and
+`SPNG_FMT_GA16` to the red and alpha channels of `SPNG_FMT_RGBA16` output.
 
 ## Progressive image decoding
 
